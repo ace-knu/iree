@@ -81,6 +81,13 @@ public:
 
   // Adds passes to the |buildPreprocessingPassPipeline| pipeline at the end.
   virtual void extendPreprocessingPassPipeline(OpPassManager &passManager) {}
+
+  // Adds passes to the |buildFlowTransformPassPipeline| pipeline at the end,
+  // i.e. after dispatch regions have been formed and outlined but before the
+  // Stream phase. Lets a plugin operate on `flow.dispatch`/`flow.executable`
+  // (e.g. per-dispatch device placement) which is not possible from the
+  // earlier input-conversion/preprocessing hooks.
+  virtual void extendFlowTransformPassPipeline(OpPassManager &passManager) {}
 };
 
 // Policy for how to activate the plugin.

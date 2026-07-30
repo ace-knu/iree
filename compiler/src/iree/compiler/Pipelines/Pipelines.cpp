@@ -394,6 +394,9 @@ void buildIREEVMTransformPassPipeline(
         hooks.beforePhase(IREEVMPipelinePhase::Flow, passManager);
       }
       IREE::Flow::buildFlowTransformPassPipeline(passManager, flowOptions);
+      if (hooks.pipelineExtensions) {
+        hooks.pipelineExtensions->extendFlowTransformPassPipeline(passManager);
+      }
       if (hooks.afterPhase) {
         hooks.afterPhase(IREEVMPipelinePhase::Flow, passManager);
       }
