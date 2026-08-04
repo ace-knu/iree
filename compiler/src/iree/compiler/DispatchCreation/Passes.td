@@ -302,7 +302,9 @@ def FormDispatchRegionsPass :
     Option<"fusePadWithConsumers", "fuse-pad-with-consumers", "bool",
            /*default=*/"false", "Enable fusing pad with consumer">,
     Option<"fusePadWithProducers", "fuse-pad-with-producers", "bool",
-           /*default=*/"false", "Enable fusion of pad with producers">
+           /*default=*/"false", "Enable fusion of pad with producers">,
+    Option<"noFuseIntoContractionConvRoots", "no-fuse-into-contraction-conv-roots", "bool",
+           /*default=*/"false", "Do not fuse any consumer/producer into a contraction/convolution dispatch root (keeps the root a plain op; used by backends that cannot yet codegen fused contraction dispatches)">
   ];
   let description = [{
     Pass to form dispatch.region ops from Linalg on tensor ops. A dispatch region

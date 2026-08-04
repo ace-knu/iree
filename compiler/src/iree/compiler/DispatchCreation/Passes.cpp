@@ -39,6 +39,14 @@ static llvm::cl::opt<bool> clEnableFusePaddingIntoLinalgProducerOps(
     llvm::cl::desc("Enable fusing tensor.pad ops into Linalg consumer ops."),
     llvm::cl::init(false));
 
+static llvm::cl::opt<bool> clNoFuseIntoContractionConvRoots(
+    "iree-dispatch-creation-no-fuse-into-contraction-conv-roots",
+    llvm::cl::desc("Do not fuse any consumer/producer into a "
+                   "contraction/convolution dispatch root, keeping the root a "
+                   "plain op. Used by backends (e.g. amd-aie) that cannot yet "
+                   "codegen fused contraction dispatches."),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<bool> clEnableFuseHorizontalContractions(
     "iree-dispatch-creation-enable-fuse-horizontal-contractions",
     llvm::cl::desc(
@@ -233,7 +241,8 @@ static void addDispatchRegionCreationPasses(OpPassManager &passManager,
             FormDispatchRegionsPassOptions{
                 options.enableAggressiveFusion, options.enableFuseMultiUse,
                 options.enableFusePaddingIntoLinalgConsumerOps,
-                clEnableFusePaddingIntoLinalgProducerOps});
+                clEnableFusePaddingIntoLinalgProducerOps,
+                clNoFuseIntoContractionConvRoots});
       })
       // Elementwise fuse operations that are iside a dispatch if possible.
       .addPass([&]() {

@@ -477,6 +477,18 @@ static bool canUseInOperandAsInitOperand(OpOperand *inOperand,
   return true;
 }
 
+/// Returns true if `op` is a contraction or convolution op. Such ops are always
+/// their own fusion-group root (they have reduction loops, so they never fuse as
+/// a consumer), so checking the op directly is equivalent to checking its group
+/// root -- and avoids a fusion-group map lookup on ops not yet grouped.
+static bool isContractionOrConvOp(Operation *op) {
+  auto linalgOp = dyn_cast_or_null<linalg::LinalgOp>(op);
+  if (!linalgOp)
+    return false;
+  return linalg::isaContractionOpInterface(linalgOp) ||
+         isa<linalg::ConvolutionOpInterface>(op);
+}
+
 /// Returns true if this is a fusable use, while fusing a root with its
 /// consumer.
 static bool
@@ -484,6 +496,16 @@ isFusableWithConsumer(OpOperand &fusedOperand, const FusionTracker &tracker,
                       FormDispatchRegionsPassOptions const &options) {
   Operation *producer = fusedOperand.get().getDefiningOp();
   Operation *consumer = fusedOperand.getOwner();
+
+  // Keep contraction/convolution dispatches to a single plain op: never fuse
+  // across a contraction/conv group boundary when requested (backends that
+  // can't yet codegen fused contraction dispatches, e.g. amd-aie). Blocking
+  // whenever either endpoint is in such a group keeps the contraction/conv op
+  // isolated in its own dispatch.
+  if (options.noFuseIntoContractionConvRoots &&
+      (isContractionOrConvOp(producer) || isContractionOrConvOp(consumer))) {
+    return false;
+  }
 
   // If consumer is a dequant operation, dont fuse it. These get cloned
   // into their consumers.
@@ -705,6 +727,15 @@ static bool isFusableWithProducer(OpOperand &operand,
                                   bool fuseWithTruncate) {
   Operation *producer = operand.get().getDefiningOp();
   Operation *consumer = operand.getOwner();
+
+  // Keep contraction/convolution dispatches to a single plain op: block fusion
+  // whenever either endpoint is in a contraction/conv group (see above). This
+  // also prevents a contraction/conv producer from being pulled into an
+  // elementwise consumer's dispatch.
+  if (options.noFuseIntoContractionConvRoots &&
+      (isContractionOrConvOp(producer) || isContractionOrConvOp(consumer))) {
+    return false;
+  }
 
   if (!fuseWithTruncate && IREE::LinalgExt::isBitTruncateOp(producer)) {
     return false;
@@ -1053,7 +1084,7 @@ void FormDispatchRegionsPass::runOnOperation() {
   TensorDimTrackingRewriter rewriter(funcOp);
   FormDispatchRegionsPassOptions options{
       aggressiveFusion, fuseMultiUseProducers, fusePadWithConsumers,
-      fusePadWithProducers};
+      fusePadWithProducers, noFuseIntoContractionConvRoots};
   if (failed(createFusionGroups(rewriter, funcOp, dominanceInfo, options))) {
     funcOp->emitOpError("failed to create fusion groups");
     return signalPassFailure();
