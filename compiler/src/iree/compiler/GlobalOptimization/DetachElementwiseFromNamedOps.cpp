@@ -29,6 +29,18 @@ namespace mlir::iree_compiler::GlobalOptimization {
 #define GEN_PASS_DEF_DETACHELEMENTWISEFROMNAMEDOPSPASS
 #include "iree/compiler/GlobalOptimization/Passes.h.inc"
 
+// When set, the init operand of a contraction/convolution is inspected through
+// `tensor.collapse_shape`/`expand_shape` ops. This lets a bias that was reshaped
+// (e.g. im2col wraps the conv's bias broadcast in a collapse_shape) still be
+// detached into a separate elementwise add, leaving a plain fill-initialized
+// contraction. Off by default so other backends see no change.
+static llvm::cl::opt<bool> clDetachElementwiseThroughReshape(
+    "iree-global-opt-detach-elementwise-through-reshape",
+    llvm::cl::desc("Look through reshape ops on a contraction/conv init operand "
+                   "when detaching elementwise ops, so reshaped bias operands "
+                   "(e.g. from im2col) are still detached."),
+    llvm::cl::init(false));
+
 namespace {
 
 struct DetachElementwisePattern : OpInterfaceRewritePattern<linalg::LinalgOp> {
@@ -58,7 +70,17 @@ struct DetachElementwisePattern : OpInterfaceRewritePattern<linalg::LinalgOp> {
     }
     Value outputOperand = outputOperands.front()->get();
 
-    auto outsDefiningOp = outputOperand.getDefiningOp<linalg::LinalgOp>();
+    // Find the op defining the init, optionally looking through reshape ops so
+    // a reshaped bias (e.g. im2col wraps the bias broadcast in a
+    // collapse_shape) is still detected as a detach-able elementwise init.
+    Operation *initDefiningOp = outputOperand.getDefiningOp();
+    if (clDetachElementwiseThroughReshape) {
+      while (isa_and_nonnull<tensor::CollapseShapeOp, tensor::ExpandShapeOp>(
+          initDefiningOp)) {
+        initDefiningOp = initDefiningOp->getOperand(0).getDefiningOp();
+      }
+    }
+    auto outsDefiningOp = dyn_cast_or_null<linalg::LinalgOp>(initDefiningOp);
     if (!outsDefiningOp || isa<linalg::FillOp>(outsDefiningOp.getOperation())) {
       // If not linalg op, or is a fill op, do nothing.
       return failure();
