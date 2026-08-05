@@ -32,6 +32,14 @@ static llvm::cl::opt<bool> clExportBenchmarkFuncs(
         "unique flow.executable that dispatches with dummy arguments."),
     llvm::cl::init(false));
 
+static llvm::cl::opt<bool> clEnableDeduplicateExecutables(
+    "iree-flow-enable-executable-deduplication",
+    llvm::cl::desc(
+        "Deduplicates equivalent executables created from dispatch regions. "
+        "Disabling keeps identical dispatches as separate executables, which "
+        "some backends require to keep per-dispatch constant offsets static."),
+    llvm::cl::init(true));
+
 // TODO(ravishankarm): Change to a pipeline option.
 static llvm::cl::opt<bool> clTraceDispatchTensors(
     "iree-flow-trace-dispatch-tensors",
@@ -181,7 +189,9 @@ void buildFlowTransformPassPipeline(OpPassManager &passManager,
   // Note: this only deduplicates equivalent executables. We could in addition
   // generalize executables to prune further (e.g. by promoting a dimension to
   // an argument if two executables differ only in that one dimension).
-  passManager.addPass(IREE::Flow::createDeduplicateExecutablesPass());
+  if (clEnableDeduplicateExecutables) {
+    passManager.addPass(IREE::Flow::createDeduplicateExecutablesPass());
+  }
 
   // Create one function per exported program entry point that can be used with
   // iree-benchmark-module to benchmark each function individually. Whether
