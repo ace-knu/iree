@@ -23,6 +23,7 @@ iree_lit_test_suite(
             "capture_scf_for_dynamic_dims.mlir",
             "cleanup_tensor_shapes.mlir",
             "deduplicate_executables.mlir",
+            "deduplicate_executables_pipeline.mlir",
             "export_benchmark_funcs.mlir",
             "initialize_empty_tensors.mlir",
             "inject_dispatch_tracing.mlir",

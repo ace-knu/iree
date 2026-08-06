@@ -1,4 +1,5 @@
 // RUN: iree-opt --split-input-file --iree-global-opt-detach-elementwise-from-named-ops --mlir-print-local-scope %s | FileCheck %s
+// RUN: iree-opt --split-input-file --iree-global-opt-detach-elementwise-from-named-ops --iree-global-opt-detach-elementwise-through-reshape --mlir-print-local-scope %s | FileCheck %s --check-prefix=THROUGH-RESHAPE
 
 util.func public @matmul(%a: tensor<?x64xf32>, %b: tensor<64x?xf32>, %c: tensor<?x?xf32>) -> tensor<?x?xf32> {
   %0 = linalg.generic {
@@ -201,3 +202,48 @@ util.func public @generic_cst_output(%arg0 : tensor<114x114x64xf32>) -> tensor<5
 //       CHECK:   %[[GENERIC:.+]] = linalg.generic
 //  CHECK-SAME:       outs(%[[FILL]] :
 //       CHECK:   util.return %[[GENERIC]]
+
+// -----
+
+// The init operand reaches the contraction through a reshape, which the default
+// matcher stops at. `--iree-global-opt-detach-elementwise-through-reshape` looks
+// through expand/collapse so the elementwise init is still detached, leaving the
+// contraction with a plain fill init and the original value added back after.
+// im2col produces exactly this shape (a bias reshaped onto the conv init).
+
+util.func public @detach_through_expand_shape(%a: tensor<8x16xf32>,
+    %b: tensor<16x32xf32>, %bias: tensor<256xf32>) -> tensor<8x32xf32> {
+  %empty = tensor.empty() : tensor<256xf32>
+  %biased = linalg.generic {
+      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+      iterator_types = ["parallel"]}
+      ins(%bias : tensor<256xf32>) outs(%empty : tensor<256xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      %m = arith.mulf %in, %in : f32
+      linalg.yield %m : f32
+  } -> tensor<256xf32>
+  %init = tensor.expand_shape %biased [[0, 1]] output_shape [8, 32]
+      : tensor<256xf32> into tensor<8x32xf32>
+  %mm = linalg.matmul ins(%a, %b : tensor<8x16xf32>, tensor<16x32xf32>)
+      outs(%init : tensor<8x32xf32>) -> tensor<8x32xf32>
+  util.return %mm : tensor<8x32xf32>
+}
+
+// Without the option the reshape hides the elementwise init, so nothing is
+// detached and the matmul still accumulates into it.
+//      CHECK-LABEL: @detach_through_expand_shape
+//            CHECK:   %[[EXPANDED:.+]] = tensor.expand_shape
+//            CHECK:   %[[MM:.+]] = linalg.matmul
+//       CHECK-SAME:       outs(%[[EXPANDED]] :
+//            CHECK:   util.return %[[MM]]
+//        CHECK-NOT:   linalg.fill
+
+// With it the init becomes a zero fill and the value is added back afterwards.
+//      THROUGH-RESHAPE-LABEL: @detach_through_expand_shape
+//            THROUGH-RESHAPE:   %[[EXP:.+]] = tensor.expand_shape
+//            THROUGH-RESHAPE:   %[[FILL:.+]] = linalg.fill
+//            THROUGH-RESHAPE:   %[[MATMUL:.+]] = linalg.matmul
+//       THROUGH-RESHAPE-SAME:       outs(%[[FILL]] :
+//            THROUGH-RESHAPE:   %[[ADD:.+]] = linalg.generic
+//       THROUGH-RESHAPE-SAME:       ins(%[[MATMUL]], %[[EXP]] :
+//            THROUGH-RESHAPE:   util.return %[[ADD]]

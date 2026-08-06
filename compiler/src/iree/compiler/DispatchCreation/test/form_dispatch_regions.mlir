@@ -1,5 +1,6 @@
 // RUN: iree-opt --pass-pipeline="builtin.module(util.func(iree-dispatch-creation-form-dispatch-regions{aggressive-fusion=true}))" --split-input-file %s | FileCheck %s
 // RUN: iree-opt --pass-pipeline="builtin.module(util.func(iree-dispatch-creation-form-dispatch-regions{aggressive-fusion=true fuse-multi-use-producers=false}))" --split-input-file %s | FileCheck %s --check-prefix=NO-MULTI-USE
+// RUN: iree-opt --pass-pipeline="builtin.module(util.func(iree-dispatch-creation-form-dispatch-regions{aggressive-fusion=true no-fuse-into-contraction-conv-roots=true}))" --split-input-file %s | FileCheck %s --check-prefix=NO-FUSE-ROOTS
 // RUN: iree-opt --pass-pipeline="builtin.module(util.func(iree-dispatch-creation-form-dispatch-regions))" --split-input-file %s | FileCheck %s --check-prefix=DEFAULT
 
 util.func public @pack_elementwise_fusion(%arg0 : tensor<?xf32>,
@@ -3093,3 +3094,50 @@ util.func public @pack_per_operand_rejection(
 //            CHECK:     linalg.pack %[[RX]]#0
 //       CHECK-SAME:       into %[[RX]]#1
 //            CHECK:     flow.return
+
+// -----
+
+// With `no-fuse-into-contraction-conv-roots`, a contraction dispatch is kept to
+// the contraction alone: an elementwise consumer that would otherwise be pulled
+// into the same region becomes its own dispatch. Backends that cannot yet
+// codegen a fused contraction dispatch depend on this.
+
+util.func public @no_fuse_into_contraction_root(%arg0 : tensor<?x?xf32>,
+    %arg1 : tensor<?x?xf32>) -> tensor<?x?xf32> {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %d0 = tensor.dim %arg1, %c0 : tensor<?x?xf32>
+  %d1 = tensor.dim %arg1, %c1 : tensor<?x?xf32>
+  %empty = tensor.empty(%d0, %d1) : tensor<?x?xf32>
+  %mm = linalg.matmul ins(%arg0, %arg1 : tensor<?x?xf32>, tensor<?x?xf32>)
+          outs(%empty : tensor<?x?xf32>) -> tensor<?x?xf32>
+  %gen = linalg.generic  {
+      indexing_maps = [affine_map<(d0, d1) -> (d1, d0)>,
+                       affine_map<(d0, d1) -> (d1, d0)>,
+                       affine_map<(d0, d1) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel"]}
+      ins(%mm, %mm : tensor<?x?xf32>, tensor<?x?xf32>)
+      outs(%empty : tensor<?x?xf32>) {
+    ^bb0(%b0 : f32, %b1 : f32, %b2 :f32) :
+      %add = arith.addf %b0, %b1 : f32
+      linalg.yield %add : f32
+  } -> tensor<?x?xf32>
+  util.return %gen : tensor<?x?xf32>
+}
+// Default: the consumer is fused into the contraction's region.
+//      CHECK-LABEL: @no_fuse_into_contraction_root
+//            CHECK:   flow.dispatch.region
+//            CHECK:     %[[MM:.+]] = linalg.matmul
+//            CHECK:     linalg.generic
+//       CHECK-SAME:       ins(%[[MM]], %[[MM]]
+//            CHECK:     flow.return
+
+// With the option: two regions, and the consumer reads the first one's result.
+//      NO-FUSE-ROOTS-LABEL: @no_fuse_into_contraction_root
+//            NO-FUSE-ROOTS:   %[[MMREGION:.+]] = flow.dispatch.region
+//            NO-FUSE-ROOTS:     linalg.matmul
+//            NO-FUSE-ROOTS:     flow.return
+//            NO-FUSE-ROOTS:   flow.dispatch.region
+//            NO-FUSE-ROOTS:     linalg.generic
+//       NO-FUSE-ROOTS-SAME:       ins(%[[MMREGION]], %[[MMREGION]]
+//            NO-FUSE-ROOTS:     flow.return
