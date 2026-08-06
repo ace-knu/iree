@@ -233,10 +233,10 @@ util.func public @detach_through_expand_shape(%a: tensor<8x16xf32>,
 // detached and the matmul still accumulates into it.
 //      CHECK-LABEL: @detach_through_expand_shape
 //            CHECK:   %[[EXPANDED:.+]] = tensor.expand_shape
+//        CHECK-NOT:   linalg.fill
 //            CHECK:   %[[MM:.+]] = linalg.matmul
 //       CHECK-SAME:       outs(%[[EXPANDED]] :
 //            CHECK:   util.return %[[MM]]
-//        CHECK-NOT:   linalg.fill
 
 // With it the init becomes a zero fill and the value is added back afterwards.
 //      THROUGH-RESHAPE-LABEL: @detach_through_expand_shape
