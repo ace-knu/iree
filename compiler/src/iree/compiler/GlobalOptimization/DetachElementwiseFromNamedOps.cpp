@@ -81,8 +81,13 @@ struct DetachElementwisePattern : OpInterfaceRewritePattern<linalg::LinalgOp> {
       }
     }
     auto outsDefiningOp = dyn_cast_or_null<linalg::LinalgOp>(initDefiningOp);
-    if (!outsDefiningOp || isa<linalg::FillOp>(outsDefiningOp.getOperation())) {
-      // If not linalg op, or is a fill op, do nothing.
+    if (!outsDefiningOp || isa<linalg::FillOp>(outsDefiningOp.getOperation()) ||
+        isa<linalg::BroadcastOp>(outsDefiningOp.getOperation())) {
+      // If not linalg op, or is a fill op, do nothing. A broadcast op is also
+      // left alone: it is how a backend (e.g. AMD-AIE's
+      // AMDAIEFoldBroadcastAddIntoDestPass) folds a broadcasted bias directly
+      // into a contraction/conv's accumulator init, and detaching it back into
+      // a separate add here would silently undo that fusion.
       return failure();
     }
     auto outputType = cast<RankedTensorType>(outputOperand.getType());
