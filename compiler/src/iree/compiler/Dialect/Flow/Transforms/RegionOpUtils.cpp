@@ -750,6 +750,62 @@ static bool isUncloneableOp(Operation *op) {
   return false;
 }
 
+/// Returns true if `op` is a pure broadcast: a `linalg.generic` whose body just
+/// forwards its single input, and which writes every element of a result that
+/// only adds new iteration dimensions (no transpose, no computation).
+static bool isPureBroadcastOp(Operation *op) {
+  auto genericOp = dyn_cast<linalg::GenericOp>(op);
+  if (!genericOp || !genericOp.hasPureTensorSemantics()) {
+    return false;
+  }
+  if (genericOp.getNumDpsInputs() != 1 || genericOp.getNumDpsInits() != 1) {
+    return false;
+  }
+  if (genericOp.getNumParallelLoops() != genericOp.getNumLoops()) {
+    return false;
+  }
+  Block &body = genericOp.getRegion().front();
+  auto yieldOp = dyn_cast<linalg::YieldOp>(body.getTerminator());
+  if (!yieldOp || yieldOp.getNumOperands() != 1 ||
+      yieldOp.getOperand(0) != body.getArgument(0) ||
+      !body.without_terminator().empty()) {
+    return false;
+  }
+  if (!genericOp.getMatchingIndexingMap(genericOp.getDpsInitOperand(0))
+           .isIdentity()) {
+    return false;
+  }
+  AffineMap inputMap =
+      genericOp.getMatchingIndexingMap(genericOp.getDpsInputOperand(0));
+  return inputMap.isProjectedPermutation(/*allowZeroInResults=*/false) &&
+         inputMap.getNumResults() < inputMap.getNumDims();
+}
+
+/// Returns true for a pure broadcast whose every consumer is a contraction
+/// reading it as a non-init operand. Such a broadcast is cloned into each
+/// consumer's dispatch rather than materialized: its result is a whole
+/// multiple of its source (e.g. an activation shared by per-head Q/K/V
+/// projections, replicated once per head), so materializing it costs a
+/// dispatch plus a buffer that much larger, while inside the consumer the
+/// broadcast collapses into the operand read the consumer was doing anyway.
+static bool isBroadcastOfContractionOperand(Operation *op) {
+  if (!isPureBroadcastOp(op)) {
+    return false;
+  }
+  for (OpOperand &use : op->getUses()) {
+    Operation *user = use.getOwner();
+    if (isa<tensor::DimOp>(user)) {
+      continue;
+    }
+    auto linalgUser = dyn_cast<linalg::LinalgOp>(user);
+    if (!linalgUser || !linalg::isaContractionOpInterface(linalgUser) ||
+        linalgUser.isDpsInit(&use)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 static bool isAttentionMaskGenerator(Operation *op) {
   for (OpOperand &use : op->getUses()) {
     if (auto attention =
@@ -796,6 +852,10 @@ bool isCloneableIntoDispatchOp(Operation *op,
     return true;
   }
   if (LinalgExt::isBitExtendOp(op)) {
+    return true;
+  }
+
+  if (isBroadcastOfContractionOperand(op)) {
     return true;
   }
 
