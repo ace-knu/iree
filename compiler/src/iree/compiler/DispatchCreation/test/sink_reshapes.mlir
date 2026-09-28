@@ -289,3 +289,53 @@ func.func @bubble_across_bit_extend(%arg0: tensor<2x64x32xf16>, %arg1 : tensor<2
 //       CHECK:   %[[GEN1:.+]] = linalg.generic
 //  CHECK-SAME:       ins(%[[GEN0]] :
 //       CHECK:   return %[[GEN1]]
+
+// -----
+
+// A K-axis bias fold widens a producer's [1, 32, 3072] result to 3136 columns.
+// With a unit-dim collapse between the producer and the insert-into-fill, the
+// insert cannot be fused with its producer; sunk below the insert, it can.
+func.func @sink_unit_collapse_below_insert_into_fill(%arg0 : tensor<1x32x3072xi8>) -> tensor<32x3136xi8> {
+  %c1 = arith.constant 1 : i8
+  %empty = tensor.empty() : tensor<1x32x3072xi8>
+  %0 = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d1, d2)>, affine_map<(d0, d1, d2) -> (d0, d1, d2)>],
+      iterator_types = ["parallel", "parallel", "parallel"]}
+      ins(%arg0 : tensor<1x32x3072xi8>) outs(%empty : tensor<1x32x3072xi8>) {
+  ^bb0(%in: i8, %out: i8):
+    %s = arith.addi %in, %in : i8
+    linalg.yield %s : i8
+  } -> tensor<1x32x3072xi8>
+  %collapsed = tensor.collapse_shape %0 [[0, 1], [2]] : tensor<1x32x3072xi8> into tensor<32x3072xi8>
+  %dest = tensor.empty() : tensor<32x3136xi8>
+  %fill = linalg.fill ins(%c1 : i8) outs(%dest : tensor<32x3136xi8>) -> tensor<32x3136xi8>
+  %inserted = tensor.insert_slice %collapsed into %fill[0, 0] [32, 3072] [1, 1]
+      : tensor<32x3072xi8> into tensor<32x3136xi8>
+  func.return %inserted : tensor<32x3136xi8>
+}
+// CHECK-LABEL: func @sink_unit_collapse_below_insert_into_fill
+//       CHECK:   %[[GEN:.+]] = linalg.generic
+//       CHECK:   %[[EMPTY:.+]] = tensor.empty() : tensor<1x32x3136xi8>
+//       CHECK:   %[[FILL:.+]] = linalg.fill ins(%{{.+}} : i8) outs(%[[EMPTY]]
+//       CHECK:   %[[INS:.+]] = tensor.insert_slice %[[GEN]] into %[[FILL]][0, 0, 0] [1, 32, 3072] [1, 1, 1]
+//       CHECK:   %[[COL:.+]] = tensor.collapse_shape %[[INS]] {{\[}}[0, 1], [2]] : tensor<1x32x3136xi8> into tensor<32x3136xi8>
+//       CHECK:   return %[[COL]]
+
+// -----
+
+// The same widening in two layers, sharing one CSE'd fill: both get sunk.
+func.func @sink_unit_collapse_below_insert_into_shared_fill(%arg0 : tensor<1x32x3072xi8>, %arg1 : tensor<1x32x3072xi8>) -> (tensor<32x3136xi8>, tensor<32x3136xi8>) {
+  %c1 = arith.constant 1 : i8
+  %a = tensor.collapse_shape %arg0 [[0, 1], [2]] : tensor<1x32x3072xi8> into tensor<32x3072xi8>
+  %b = tensor.collapse_shape %arg1 [[0, 1], [2]] : tensor<1x32x3072xi8> into tensor<32x3072xi8>
+  %dest = tensor.empty() : tensor<32x3136xi8>
+  %fill = linalg.fill ins(%c1 : i8) outs(%dest : tensor<32x3136xi8>) -> tensor<32x3136xi8>
+  %0 = tensor.insert_slice %a into %fill[0, 0] [32, 3072] [1, 1] : tensor<32x3072xi8> into tensor<32x3136xi8>
+  %1 = tensor.insert_slice %b into %fill[0, 0] [32, 3072] [1, 1] : tensor<32x3072xi8> into tensor<32x3136xi8>
+  func.return %0, %1 : tensor<32x3136xi8>, tensor<32x3136xi8>
+}
+// CHECK-LABEL: func @sink_unit_collapse_below_insert_into_shared_fill
+//  CHECK-SAME:     %[[ARG0:[a-zA-Z0-9]+]]: tensor<1x32x3072xi8>
+//  CHECK-SAME:     %[[ARG1:[a-zA-Z0-9]+]]: tensor<1x32x3072xi8>
+//   CHECK-DAG:   tensor.insert_slice %[[ARG0]] into %{{.+}}[0, 0, 0] [1, 32, 3072] [1, 1, 1] {{.+}} into tensor<1x32x3136xi8>
+//   CHECK-DAG:   tensor.insert_slice %[[ARG1]] into %{{.+}}[0, 0, 0] [1, 32, 3072] [1, 1, 1] {{.+}} into tensor<1x32x3136xi8>

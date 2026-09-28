@@ -168,6 +168,98 @@ static bool shouldSinkExpandShapeOp(tensor::ExpandShapeOp expandOp,
   return true;
 }
 
+/// Sinks a `collapse_shape` that only drops unit dimensions below the
+/// `tensor.insert_slice` that writes its result into a filled tensor:
+///
+///   insert_slice(collapse_shape(x) into fill(c, empty))
+///     -> collapse_shape(insert_slice(x into fill(c, expanded empty)))
+///
+/// This is how a K-axis bias fold widens an activation whose producer yields a
+/// unit leading dimension. Dispatch formation fuses an insert-into-fill with its
+/// producer only when the inserted value is that producer's result itself, so
+/// with the collapse in between the widening becomes a copy dispatch of its own.
+/// With the collapse sunk, the producer writes the widened buffer in place.
+struct SinkUnitCollapseBelowInsertIntoFill final
+    : OpRewritePattern<tensor::InsertSliceOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tensor::InsertSliceOp insertOp,
+                                PatternRewriter &rewriter) const override {
+    auto collapseOp =
+        insertOp.getSource().getDefiningOp<tensor::CollapseShapeOp>();
+    // Dispatch formation fuses the insert with its producer only when the
+    // inserted value has no other use, so sinking is only worth it then;
+    // otherwise it would merely reshape a widening that already fuses.
+    if (!collapseOp || !collapseOp->hasOneUse() ||
+        !collapseOp.getSrc().hasOneUse()) {
+      return failure();
+    }
+    // The fill may be shared -- CSE merges the identical constant fills of
+    // every layer's widening into one. A fresh fill is built below either way.
+    auto fillOp = insertOp.getDest().getDefiningOp<linalg::FillOp>();
+    if (!fillOp || !fillOp.getOutputs()[0].getDefiningOp<tensor::EmptyOp>()) {
+      return failure();
+    }
+    RankedTensorType srcType = collapseOp.getSrcType();
+    RankedTensorType destType = insertOp.getDestType();
+    if (!srcType.hasStaticShape() || !destType.hasStaticShape() ||
+        insertOp.getSourceType() != collapseOp.getResultType()) {
+      return failure();
+    }
+    ArrayRef<int64_t> offsets = insertOp.getStaticOffsets();
+    ArrayRef<int64_t> sizes = insertOp.getStaticSizes();
+    ArrayRef<int64_t> strides = insertOp.getStaticStrides();
+    if (ShapedType::isDynamicShape(offsets) ||
+        ArrayRef<int64_t>(sizes) != collapseOp.getResultType().getShape() ||
+        llvm::any_of(strides, [](int64_t s) { return s != 1; })) {
+      return failure();
+    }
+
+    // Each collapsed dimension merges a group of `x`'s dimensions of which at
+    // most one is not a unit; that one takes the destination's extent and the
+    // insert offset, the unit ones stay 1 at offset 0.
+    SmallVector<int64_t> expandedShape, newOffsets;
+    for (auto [destDim, group] :
+         llvm::enumerate(collapseOp.getReassociationIndices())) {
+      int64_t carrier = group.back();
+      int64_t nonUnit = 0;
+      for (int64_t dim : group) {
+        if (srcType.getDimSize(dim) != 1) {
+          carrier = dim;
+          ++nonUnit;
+        }
+      }
+      if (nonUnit > 1) {
+        return failure();
+      }
+      for (int64_t dim : group) {
+        bool isCarrier = dim == carrier;
+        expandedShape.push_back(isCarrier ? destType.getDimSize(destDim) : 1);
+        newOffsets.push_back(isCarrier ? offsets[destDim] : 0);
+      }
+    }
+
+    Location loc = insertOp.getLoc();
+    Value empty = tensor::EmptyOp::create(rewriter, loc, expandedShape,
+                                          destType.getElementType());
+    Value fill = linalg::FillOp::create(rewriter, loc, fillOp.getInputs(),
+                                        ValueRange{empty})
+                     .getResult(0);
+    SmallVector<OpFoldResult> offsetValues =
+        getAsIndexOpFoldResult(rewriter.getContext(), newOffsets);
+    SmallVector<OpFoldResult> sizeValues =
+        getAsIndexOpFoldResult(rewriter.getContext(), srcType.getShape());
+    SmallVector<OpFoldResult> strideValues(srcType.getRank(),
+                                           rewriter.getIndexAttr(1));
+    Value inserted = tensor::InsertSliceOp::create(
+        rewriter, loc, collapseOp.getSrc(), fill, offsetValues, sizeValues,
+        strideValues);
+    rewriter.replaceOpWithNewOp<tensor::CollapseShapeOp>(
+        insertOp, destType, inserted, collapseOp.getReassociationIndices());
+    return success();
+  }
+};
+
 void SinkReshapesPass::runOnOperation() {
   MLIRContext *context = &getContext();
 
@@ -200,6 +292,22 @@ void SinkReshapesPass::runOnOperation() {
   if (failed(applyPatternsGreedily(getOperation(),
                                    std::move(sinkReshapePatterns)))) {
     getOperation()->emitOpError("failed to sink reshape ops");
+    return signalPassFailure();
+  }
+
+  // Separately and last: the patterns above move collapses the other way (up
+  // through fills), and mixed into the same driver the two settle on different
+  // shapes for widenings that already fuse. Run alone, with no folding, this
+  // only touches the insert-into-fill widenings that still have a collapse
+  // between them and their producer.
+  RewritePatternSet widenPatterns(context);
+  widenPatterns.add<SinkUnitCollapseBelowInsertIntoFill>(context);
+  GreedyRewriteConfig config;
+  config.enableFolding(false).enableConstantCSE(false);
+  config.setRegionSimplificationLevel(GreedySimplifyRegionLevel::Disabled);
+  if (failed(applyPatternsGreedily(getOperation(), std::move(widenPatterns),
+                                   config))) {
+    getOperation()->emitOpError("failed to sink unit collapses below inserts");
     return signalPassFailure();
   }
 }
