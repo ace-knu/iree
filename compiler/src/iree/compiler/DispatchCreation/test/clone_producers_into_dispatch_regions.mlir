@@ -935,3 +935,46 @@ util.func public @dont_clone_gather_like(%arg0: tensor<4x1x4xi64>, %arg1: tensor
 //       CHECK:      %[[ATTENTION:.+]] = iree_linalg_ext.attention
 //       CHECK:        ins({{.*}}, %[[DISPATCHK]], %[[DISPATCHV]]
 //       CHECK:      flow.return %[[ATTENTION]]
+
+// -----
+
+// A producer region writes a widened buffer (a K-axis bias fold's activation);
+// another region reads its first 768 columns through the expand/slice/collapse
+// chain unit-dim folding leaves. The chain becomes one slice of the region's
+// result, cloned into the reading region, so the read happens in place instead
+// of as a copy dispatch.
+util.func public @slice_of_widened_region_result(%arg0 : tensor<32x768xi8>) -> (tensor<32x832xi8>, tensor<32x768xi8>) {
+  %c1 = arith.constant 1 : i8
+  %0 = flow.dispatch.region -> (tensor<32x832xi8>) {
+    %empty = tensor.empty() : tensor<32x832xi8>
+    %fill = linalg.fill ins(%c1 : i8) outs(%empty : tensor<32x832xi8>) -> tensor<32x832xi8>
+    %ins = tensor.insert_slice %arg0 into %fill[0, 0] [32, 768] [1, 1] : tensor<32x768xi8> into tensor<32x832xi8>
+    flow.return %ins : tensor<32x832xi8>
+  }
+  %expand = tensor.expand_shape %0 [[0, 1, 2], [3]] output_shape [1, 1, 32, 832]
+      : tensor<32x832xi8> into tensor<1x1x32x832xi8>
+  %slice = tensor.extract_slice %expand[0, 0, 0, 0] [1, 1, 32, 768] [1, 1, 1, 1]
+      : tensor<1x1x32x832xi8> to tensor<1x32x768xi8>
+  %collapse = tensor.collapse_shape %slice [[0, 1], [2]] : tensor<1x32x768xi8> into tensor<32x768xi8>
+  %1 = flow.dispatch.region -> (tensor<32x768xi8>) {
+    %empty = tensor.empty() : tensor<32x768xi8>
+    %add = linalg.generic {
+        indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>],
+        iterator_types = ["parallel", "parallel"]}
+        ins(%collapse : tensor<32x768xi8>) outs(%empty : tensor<32x768xi8>) {
+    ^bb0(%in: i8, %out: i8):
+      %s = arith.addi %in, %in : i8
+      linalg.yield %s : i8
+    } -> tensor<32x768xi8>
+    flow.return %add : tensor<32x768xi8>
+  }
+  util.return %0, %1 : tensor<32x832xi8>, tensor<32x768xi8>
+}
+// CHECK-LABEL: util.func public @slice_of_widened_region_result
+//       CHECK:   %[[WIDE:.+]] = flow.dispatch.region -> (tensor<32x832xi8>)
+//   CHECK-NOT:   tensor.expand_shape
+//   CHECK-NOT:   tensor.collapse_shape
+//       CHECK:   flow.dispatch.region -> (tensor<32x768xi8>)
+//       CHECK:     %[[SLICE:.+]] = tensor.extract_slice %[[WIDE]][0, 0] [32, 768] [1, 1]
+//       CHECK:     linalg.generic
+//  CHECK-SAME:       ins(%[[SLICE]] :
