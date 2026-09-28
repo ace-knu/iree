@@ -3772,8 +3772,12 @@ SmallVector<Range> CustomOp::getIterationDomainForDimensions(
   };
   ranges = llvm::map_to_vector(
       dims, [&](unsigned dim) { return getRange(concatMap.getResult(dim)); });
+  // `getDimExprsForSymbols` numbers symbol `k` as dim `k + numDims`, so that
+  // is where the inverted map keeps its range. Offsetting by `numSymbols`
+  // instead only happens to agree when a custom op has as many symbols as
+  // loops, and reads out of bounds otherwise.
   ranges.append(llvm::map_to_vector(symbols, [&](unsigned symbol) {
-    return getRange(concatMap.getResult(symbol + numSymbols));
+    return getRange(concatMap.getResult(symbol + numDims));
   }));
   return ranges;
 }
