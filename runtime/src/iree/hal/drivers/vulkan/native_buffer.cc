@@ -31,6 +31,10 @@ static iree_hal_vulkan_native_buffer_t* iree_hal_vulkan_native_buffer_cast(
   return (iree_hal_vulkan_native_buffer_t*)base_value;
 }
 
+bool iree_hal_vulkan_native_buffer_isa(iree_hal_buffer_t* buffer) {
+  return iree_hal_resource_is(buffer, &iree_hal_vulkan_native_buffer_vtable);
+}
+
 iree_status_t iree_hal_vulkan_native_buffer_wrap(
     iree_hal_buffer_placement_t placement, iree_hal_memory_type_t memory_type,
     iree_hal_memory_access_t allowed_access,

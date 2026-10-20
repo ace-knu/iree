@@ -35,6 +35,9 @@ iree_status_t iree_hal_vulkan_sparse_buffer_create_bound_sync(
     uint32_t memory_type_index, VkDeviceSize max_allocation_size,
     iree_allocator_t host_allocator, iree_hal_buffer_t** out_buffer);
 
+// 3DEV: Returns true if |buffer| is a sparse Vulkan buffer (not a subspan).
+bool iree_hal_vulkan_sparse_buffer_isa(iree_hal_buffer_t* buffer);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus
