@@ -10,6 +10,7 @@
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 #include "iree/base/api.h"
@@ -1035,6 +1036,19 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_dispatch_bind(
   return iree_ok_status();
 }
 
+// 3DEV debug: the [BR] binding dump below maps each binding to print its first
+// values. A Vulkan map/unmap maps/unmaps the whole VkDeviceMemory
+// (native_buffer.cc), so dumping a buffer that the CPU (local-task) is using
+// through its own mapping invalidates that mapping. Off by default; set
+// IREE_VULKAN_BR_DUMP=1 to map and print the values as before.
+static bool iree_hal_vulkan_br_dump_enabled() {
+  static const bool enabled = [] {
+    const char* value = getenv("IREE_VULKAN_BR_DUMP");
+    return value && strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
 iree_hal_buffer_ref_t g_last_bindings[8];
 iree_host_size_t g_last_binding_count = 0;
 static iree_status_t iree_hal_vulkan_direct_command_buffer_dispatch(
@@ -1050,6 +1064,18 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_dispatch(
           (unsigned)config.workgroup_count[2], (size_t)bindings.count);
   for (iree_host_size_t bi = 0; bi < bindings.count; ++bi) {
     iree_hal_buffer_ref_t ref = bindings.values[bi];
+    if (!iree_hal_vulkan_br_dump_enabled()) {
+      // No mapping: print what the ref carries.
+      fprintf(stderr,
+              "[BR] vk dispatch binding[%zu] buf=%p dev=%p type=0x%x "
+              "offset=%" PRIu64 " length=%" PRIu64 "\n",
+              (size_t)bi, (void*)ref.buffer,
+              (void*)iree_hal_buffer_allocation_placement(ref.buffer).device,
+              (unsigned)iree_hal_buffer_memory_type(ref.buffer),
+              (uint64_t)ref.offset, (uint64_t)ref.length);
+      fflush(stderr);
+      continue;
+    }
     iree_hal_buffer_mapping_t m;
     iree_status_t ms = iree_hal_buffer_map_range(ref.buffer, IREE_HAL_MAPPING_MODE_SCOPED,
         IREE_HAL_MEMORY_ACCESS_READ, ref.offset, 16, &m);
