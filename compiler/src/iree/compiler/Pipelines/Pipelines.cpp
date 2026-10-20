@@ -413,6 +413,9 @@ void buildIREEVMTransformPassPipeline(
       }
       IREE::Stream::buildStreamTransformPassPipeline(passManager,
                                                      streamOptions);
+      if (hooks.pipelineExtensions) {
+        hooks.pipelineExtensions->extendStreamTransformPassPipeline(passManager);
+      }
       if (hooks.afterPhase) {
         hooks.afterPhase(IREEVMPipelinePhase::Stream, passManager);
       }
