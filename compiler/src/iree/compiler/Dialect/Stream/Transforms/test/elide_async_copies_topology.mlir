@@ -239,3 +239,153 @@ util.func public @elide_transfer_through_scf_if(%cond: i1, %buffer: !util.buffer
 }
 
 } // module
+
+// -----
+
+// Asymmetric transparent access: @dev_b can access @dev_a memory but not the
+// reverse. A transient produced on @dev_a can stay on @dev_a and be read by
+// @dev_b, so the transfer is elided even though (a->b) is not accessible.
+
+module @test attributes {
+  stream.topology = #hal.device.topology<links = [
+    (@dev_a -> @dev_b = {}),
+    (@dev_b -> @dev_a = {transparent_access = true})
+  ]>
+} {
+
+// CHECK-LABEL: @elide_asymmetric_transient_result_accesses_source
+util.func public @elide_asymmetric_transient_result_accesses_source(%value: i32) -> !stream.resource<*> {
+  %size = arith.constant 4 : index
+  // CHECK: %[[SPLAT:.+]] = stream.async.splat
+  %splat = stream.async.splat on(#hal.device.promise<@dev_a>) %value : i32 -> !stream.resource<*>{%size}
+  // CHECK-NOT: stream.async.transfer
+  %transfer = stream.async.transfer %splat : !stream.resource<*>{%size}
+      from(#hal.device.promise<@dev_a>) -> to(#hal.device.promise<@dev_b>) !stream.resource<*>{%size}
+  // CHECK: util.return %[[SPLAT]]
+  util.return %transfer : !stream.resource<*>
+}
+
+} // module
+
+// -----
+
+// Asymmetric transparent access in the other direction: the transient source
+// can be read by the result device's owner choice (a->b accessible), so the
+// transfer is elided as before.
+
+module @test attributes {
+  stream.topology = #hal.device.topology<links = [
+    (@dev_a -> @dev_b = {transparent_access = true}),
+    (@dev_b -> @dev_a = {})
+  ]>
+} {
+
+// CHECK-LABEL: @elide_asymmetric_transient_source_accesses_result
+util.func public @elide_asymmetric_transient_source_accesses_result(%value: i32) -> !stream.resource<*> {
+  %size = arith.constant 4 : index
+  // CHECK: %[[SPLAT:.+]] = stream.async.splat
+  %splat = stream.async.splat on(#hal.device.promise<@dev_a>) %value : i32 -> !stream.resource<*>{%size}
+  // CHECK-NOT: stream.async.transfer
+  %transfer = stream.async.transfer %splat : !stream.resource<*>{%size}
+      from(#hal.device.promise<@dev_a>) -> to(#hal.device.promise<@dev_b>) !stream.resource<*>{%size}
+  // CHECK: util.return %[[SPLAT]]
+  util.return %transfer : !stream.resource<*>
+}
+
+} // module
+
+// -----
+
+// Imported storage is pinned to the import device. With only (a->b) accessible
+// the result device @dev_b cannot access the imported @dev_a buffer, so the
+// transfer must be preserved (directly and through a cast/clone chain).
+
+module @test attributes {
+  stream.topology = #hal.device.topology<links = [
+    (@dev_a -> @dev_b = {transparent_access = true}),
+    (@dev_b -> @dev_a = {})
+  ]>
+} {
+
+// CHECK-LABEL: @preserve_pinned_import_transfer
+util.func public @preserve_pinned_import_transfer(%buffer_view: !util.buffer) -> !stream.resource<external> {
+  %size = arith.constant 4 : index
+  // CHECK: %[[IMPORTED:.+]] = stream.tensor.import
+  %imported = stream.tensor.import on(#hal.device.promise<@dev_a>) %buffer_view : !util.buffer -> tensor<1xi32> in !stream.resource<external>{%size}
+  // CHECK: %[[TRANSFER:.+]] = stream.async.transfer %[[IMPORTED]]
+  // CHECK-SAME: from(#hal.device.promise<@dev_a>) -> to(#hal.device.promise<@dev_b>)
+  %transfer = stream.async.transfer %imported : !stream.resource<external>{%size}
+      from(#hal.device.promise<@dev_a>) -> to(#hal.device.promise<@dev_b>) !stream.resource<external>{%size}
+  // CHECK: util.return %[[TRANSFER]]
+  util.return %transfer : !stream.resource<external>
+}
+
+// CHECK-LABEL: @preserve_pinned_import_cast_clone_transfer
+util.func public @preserve_pinned_import_cast_clone_transfer(%buffer_view: !util.buffer) -> !stream.resource<*> {
+  %size = arith.constant 4 : index
+  %imported = stream.tensor.import on(#hal.device.promise<@dev_a>) %buffer_view : !util.buffer -> tensor<1xi32> in !stream.resource<external>{%size}
+  %cast = stream.async.cast on(#hal.device.promise<@dev_a>) %imported : !stream.resource<external>{%size} -> !stream.resource<*>{%size}
+  %clone = stream.async.clone on(#hal.device.promise<@dev_a>) %cast : !stream.resource<*>{%size} -> !stream.resource<*>{%size}
+  // CHECK: %[[TRANSFER:.+]] = stream.async.transfer
+  // CHECK-SAME: from(#hal.device.promise<@dev_a>) -> to(#hal.device.promise<@dev_b>)
+  %transfer = stream.async.transfer %clone : !stream.resource<*>{%size}
+      from(#hal.device.promise<@dev_a>) -> to(#hal.device.promise<@dev_b>) !stream.resource<*>{%size}
+  // CHECK: util.return %[[TRANSFER]]
+  util.return %transfer : !stream.resource<*>
+}
+
+} // module
+
+// -----
+
+// Imported storage pinned to @dev_a can be bound directly on @dev_b when @dev_b
+// can access @dev_a memory, so the transfer is elided.
+
+module @test attributes {
+  stream.topology = #hal.device.topology<links = [
+    (@dev_a -> @dev_b = {}),
+    (@dev_b -> @dev_a = {transparent_access = true})
+  ]>
+} {
+
+// CHECK-LABEL: @elide_pinned_import_result_accesses_source
+util.func public @elide_pinned_import_result_accesses_source(%buffer_view: !util.buffer) -> !stream.resource<external> {
+  %size = arith.constant 4 : index
+  // CHECK: %[[IMPORTED:.+]] = stream.tensor.import
+  %imported = stream.tensor.import on(#hal.device.promise<@dev_a>) %buffer_view : !util.buffer -> tensor<1xi32> in !stream.resource<external>{%size}
+  // CHECK-NOT: stream.async.transfer
+  %transfer = stream.async.transfer %imported : !stream.resource<external>{%size}
+      from(#hal.device.promise<@dev_a>) -> to(#hal.device.promise<@dev_b>) !stream.resource<external>{%size}
+  // CHECK: util.return %[[IMPORTED]]
+  util.return %transfer : !stream.resource<external>
+}
+
+} // module
+
+// -----
+
+// Constant globals are pinned to the device their initializer allocated them
+// on: with only (a->b) accessible the transfer to @dev_b is preserved.
+
+module @test attributes {
+  stream.topology = #hal.device.topology<links = [
+    (@dev_a -> @dev_b = {transparent_access = true}),
+    (@dev_b -> @dev_a = {})
+  ]>
+} {
+
+util.global private @constant : !stream.resource<constant>
+
+// CHECK-LABEL: @preserve_pinned_constant_transfer
+util.func public @preserve_pinned_constant_transfer() -> !stream.resource<constant> {
+  %size = arith.constant 4 : index
+  // CHECK: %[[CONSTANT:.+]] = util.global.load @constant
+  %constant = util.global.load @constant : !stream.resource<constant>
+  // CHECK: %[[TRANSFER:.+]] = stream.async.transfer %[[CONSTANT]]
+  %transfer = stream.async.transfer %constant : !stream.resource<constant>{%size}
+      from(#hal.device.promise<@dev_a>) -> to(#hal.device.promise<@dev_b>) !stream.resource<constant>{%size}
+  // CHECK: util.return %[[TRANSFER]]
+  util.return %transfer : !stream.resource<constant>
+}
+
+} // module
