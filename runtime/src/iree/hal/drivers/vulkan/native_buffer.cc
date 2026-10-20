@@ -11,6 +11,7 @@
 #include <cstring>
 
 #include "iree/base/api.h"
+#include "iree/base/threading/mutex.h"
 #include "iree/hal/drivers/vulkan/base_buffer.h"
 #include "iree/hal/drivers/vulkan/status_util.h"
 
@@ -19,6 +20,13 @@ typedef struct iree_hal_vulkan_native_buffer_t {
   iree::hal::vulkan::VkDeviceHandle* logical_device;
   iree_hal_vulkan_native_buffer_release_callback_t internal_release_callback;
   iree_hal_buffer_release_callback_t user_release_callback;
+  // 3DEV: host mapping of the whole device_memory, created by the first
+  // map_range and kept until the buffer is destroyed. vkMapMemory may not be
+  // called on memory that is already mapped and vkUnmapMemory unmaps the whole
+  // object, so concurrent users of one buffer (e.g. CPU dispatches on
+  // sub-ranges of a packed resource) must share a single mapping.
+  iree_slim_mutex_t mapping_mutex;
+  uint8_t* mapped_ptr;  // NULL until first mapped
 } iree_hal_vulkan_native_buffer_t;
 
 namespace {
@@ -66,6 +74,8 @@ iree_status_t iree_hal_vulkan_native_buffer_wrap(
     buffer->logical_device = logical_device;
     buffer->internal_release_callback = internal_release_callback;
     buffer->user_release_callback = user_release_callback;
+    iree_slim_mutex_initialize(&buffer->mapping_mutex);
+    buffer->mapped_ptr = NULL;
 
     *out_buffer = &buffer->base.base;
   }
@@ -82,6 +92,14 @@ static void iree_hal_vulkan_native_buffer_destroy(
   IREE_TRACE_ZONE_BEGIN(z0);
   IREE_TRACE_ZONE_APPEND_VALUE_I64(
       z0, (int64_t)iree_hal_buffer_allocation_size(base_buffer));
+
+  // 3DEV: drop the persistent mapping before the memory is released.
+  if (buffer->mapped_ptr) {
+    buffer->logical_device->syms()->vkUnmapMemory(*buffer->logical_device,
+                                                  buffer->base.device_memory);
+    buffer->mapped_ptr = NULL;
+  }
+  iree_slim_mutex_deinitialize(&buffer->mapping_mutex);
 
   if (buffer->internal_release_callback.fn) {
     buffer->internal_release_callback.fn(
@@ -129,16 +147,42 @@ static iree_status_t iree_hal_vulkan_native_buffer_map_range(
           ? IREE_HAL_BUFFER_USAGE_MAPPING_PERSISTENT
           : IREE_HAL_BUFFER_USAGE_MAPPING_SCOPED));
 
-  // TODO(benvanik): map VK_WHOLE_SIZE and subset ourselves? may need to get
-  // around some minimum mapping alignment rules.
-  uint8_t* data_ptr = nullptr;
-  VK_RETURN_IF_ERROR(logical_device->syms()->vkMapMemory(
-                         *logical_device, buffer->base.device_memory,
-                         /*offset=*/local_byte_offset,
-                         /*size=*/local_byte_length,
-                         /*flags=*/0, (void**)&data_ptr),
-                     "vkMapMemory");
+  // 3DEV: map VK_WHOLE_SIZE once and hand out sub-ranges of it (see
+  // mapping_mutex). The buffer is bound at memoryOffset 0, so
+  // local_byte_offset is also the offset into device_memory.
+  iree_slim_mutex_lock(&buffer->mapping_mutex);
+  iree_status_t status = iree_ok_status();
+  if (!buffer->mapped_ptr) {
+    void* ptr = NULL;
+    status = VK_RESULT_TO_STATUS(
+        logical_device->syms()->vkMapMemory(
+            *logical_device, buffer->base.device_memory, /*offset=*/0,
+            /*size=*/VK_WHOLE_SIZE, /*flags=*/0, &ptr),
+        "vkMapMemory");
+    if (iree_status_is_ok(status)) buffer->mapped_ptr = (uint8_t*)ptr;
+  }
+  uint8_t* base_ptr = buffer->mapped_ptr;
+  iree_slim_mutex_unlock(&buffer->mapping_mutex);
+  IREE_RETURN_IF_ERROR(status);
+  uint8_t* data_ptr = base_ptr + local_byte_offset;
   mapping->contents = iree_make_byte_span(data_ptr, local_byte_length);
+
+  // 3DEV: a fresh vkMapMemory never made device writes visible either, so for
+  // non-coherent memory read access invalidates here (whole object, which
+  // always satisfies nonCoherentAtomSize). No-op for HOST_COHERENT memory.
+  if (!iree_all_bits_set(iree_hal_buffer_memory_type(base_buffer),
+                         IREE_HAL_MEMORY_TYPE_HOST_COHERENT) &&
+      iree_any_bit_set(memory_access, IREE_HAL_MEMORY_ACCESS_READ)) {
+    VkMappedMemoryRange range;
+    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range.pNext = NULL;
+    range.memory = buffer->base.device_memory;
+    range.offset = 0;
+    range.size = VK_WHOLE_SIZE;
+    VK_RETURN_IF_ERROR(logical_device->syms()->vkInvalidateMappedMemoryRanges(
+                           *logical_device, 1, &range),
+                       "vkInvalidateMappedMemoryRanges");
+  }
 
   // If we mapped for discard scribble over the bytes. This is not a mandated
   // behavior but it will make debugging issues easier. Alternatively for
@@ -163,9 +207,25 @@ static iree_status_t iree_hal_vulkan_native_buffer_unmap_range(
         IREE_STATUS_FAILED_PRECONDITION,
         "buffer does not have device memory attached and cannot be mapped");
   }
-  auto* logical_device = buffer->logical_device;
-  logical_device->syms()->vkUnmapMemory(*logical_device,
-                                        buffer->base.device_memory);
+  // 3DEV: the mapping is persistent (see mapping_mutex); other users of the
+  // same memory may still hold pointers into it, so nothing is unmapped here.
+  // For non-coherent memory written through this mapping, flush so the device
+  // sees the data (whole object; no-op for HOST_COHERENT memory).
+  if (!iree_all_bits_set(iree_hal_buffer_memory_type(base_buffer),
+                         IREE_HAL_MEMORY_TYPE_HOST_COHERENT) &&
+      iree_any_bit_set(mapping->impl.allowed_access,
+                       IREE_HAL_MEMORY_ACCESS_WRITE)) {
+    auto* logical_device = buffer->logical_device;
+    VkMappedMemoryRange range;
+    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range.pNext = NULL;
+    range.memory = buffer->base.device_memory;
+    range.offset = 0;
+    range.size = VK_WHOLE_SIZE;
+    VK_RETURN_IF_ERROR(logical_device->syms()->vkFlushMappedMemoryRanges(
+                           *logical_device, 1, &range),
+                       "vkFlushMappedMemoryRanges");
+  }
   return iree_ok_status();
 }
 
