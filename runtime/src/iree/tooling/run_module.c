@@ -6,6 +6,9 @@
 
 #include "iree/tooling/run_module.h"
 
+#include <stdlib.h>
+#include <string.h>
+
 #include "iree/base/api.h"
 #include "iree/base/tooling/flags.h"
 #include "iree/hal/api.h"
@@ -44,6 +47,12 @@ IREE_FLAG_LIST(
     "\n"
     "Each occurrence of the flag indicates an input in the order they were\n"
     "specified on the command line.");
+
+IREE_FLAG_LIST(
+    string, input_device,
+    "EXPERIMENT: index (in --device order) of the device the i-th input\n"
+    "should be placed on. Inputs without an entry stay on the lead device.\n"
+    "  e.g.: --input_device=1 --input_device=1 --input_device=0");
 
 IREE_FLAG_LIST(
     string, output,
@@ -235,6 +244,77 @@ static iree_status_t iree_tooling_run_function(
         iree_tooling_parse_variants(arguments_cconv, FLAG_input_list(), device,
                                     device_allocator, host_allocator, &inputs),
         "parsing function inputs");
+  }
+
+  // EXPERIMENT: relocate inputs to per-input devices.
+  if (iree_status_is_ok(status) && FLAG_input_device_list().count > 0 &&
+      iree_tooling_experimental_device_group != NULL) {
+    iree_hal_buffer_params_t relocate_params = {
+        .usage = IREE_HAL_BUFFER_USAGE_DEFAULT | IREE_HAL_BUFFER_USAGE_MAPPING,
+        .access = IREE_HAL_MEMORY_ACCESS_ALL,
+        .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL |
+                IREE_HAL_MEMORY_TYPE_HOST_VISIBLE,
+        .queue_affinity = IREE_HAL_QUEUE_AFFINITY_ANY,
+        .min_alignment = 0,
+    };
+    iree_hal_device_group_t* group = iree_tooling_experimental_device_group;
+    for (iree_host_size_t i = 0;
+         i < FLAG_input_device_list().count && iree_status_is_ok(status); ++i) {
+      iree_string_view_t sv = FLAG_input_device_list().values[i];
+      if (sv.size == 0 || i >= iree_vm_list_size(inputs)) continue;
+      iree_host_size_t idx = (iree_host_size_t)atoi(sv.data);
+      if (idx >= iree_hal_device_group_device_count(group)) {
+        status = iree_make_status(IREE_STATUS_OUT_OF_RANGE,
+                                  "--input_device[%zu]=%zu out of range", i, idx);
+        break;
+      }
+      iree_hal_device_t* target = iree_hal_device_group_device_at(group, idx);
+      if (target == device) continue;  // already on the lead
+      iree_vm_variant_t v = iree_vm_variant_empty();
+      status = iree_vm_list_get_variant_assign(inputs, i, &v);
+      iree_hal_buffer_view_t* src_view =
+          iree_status_is_ok(status) ? iree_hal_buffer_view_deref(v.ref) : NULL;
+      if (iree_status_is_ok(status) && !src_view) {
+        status = iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                  "input %zu is not a buffer view", i);
+      }
+      iree_hal_buffer_t* dst = NULL;
+      iree_device_size_t len = 0;
+      if (iree_status_is_ok(status)) {
+        len = iree_hal_buffer_byte_length(iree_hal_buffer_view_buffer(src_view));
+        status = iree_hal_allocator_allocate_buffer(
+            iree_hal_device_allocator(target), relocate_params, len, &dst);
+      }
+      if (iree_status_is_ok(status)) {
+        iree_hal_buffer_mapping_t sm, dm;
+        status = iree_hal_buffer_map_range(
+            iree_hal_buffer_view_buffer(src_view), IREE_HAL_MAPPING_MODE_SCOPED,
+            IREE_HAL_MEMORY_ACCESS_READ, 0, len, &sm);
+        if (iree_status_is_ok(status)) {
+          status = iree_hal_buffer_map_range(dst, IREE_HAL_MAPPING_MODE_SCOPED,
+                                             IREE_HAL_MEMORY_ACCESS_DISCARD_WRITE,
+                                             0, len, &dm);
+          if (iree_status_is_ok(status)) {
+            memcpy(dm.contents.data, sm.contents.data, (size_t)len);
+            status = iree_hal_buffer_unmap_range(&dm);
+          }
+          iree_status_ignore(iree_hal_buffer_unmap_range(&sm));
+        }
+      }
+      iree_hal_buffer_view_t* dst_view = NULL;
+      if (iree_status_is_ok(status)) {
+        status = iree_hal_buffer_view_create_like(dst, src_view, host_allocator,
+                                                  &dst_view);
+      }
+      if (iree_status_is_ok(status)) {
+        iree_vm_ref_t ref = iree_hal_buffer_view_move_ref(dst_view);
+        status = iree_vm_list_set_ref_move(inputs, i, &ref);
+      }
+      iree_hal_buffer_release(dst);
+      fprintf(stderr, "[BR] input[%zu] -> device %zu (%s)\n", i, idx,
+              iree_status_is_ok(status) ? "ok" : "FAILED");
+      fflush(stderr);
+    }
   }
 
   // If the function is async add fences so we can invoke it synchronously.

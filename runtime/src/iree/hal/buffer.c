@@ -5,7 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/hal/buffer.h"
-
+#include <stdio.h>
 #include <inttypes.h>
 #include <stddef.h>
 #include <string.h>
@@ -275,6 +275,10 @@ IREE_API_EXPORT iree_status_t iree_hal_buffer_validate_memory_type(
     iree_hal_memory_type_t expected_memory_type) {
   if (IREE_UNLIKELY(
           !iree_all_bits_set(actual_memory_type, expected_memory_type))) {
+    fprintf(stderr, "[DBG] mem_type actual=0x%x expected=0x%x\n",
+            (unsigned)actual_memory_type, (unsigned)expected_memory_type);
+    fflush(stderr);
+  
 #if IREE_STATUS_MODE
     // Missing one or more bits.
     iree_bitfield_string_temp_t temp0, temp1;
@@ -339,6 +343,9 @@ iree_hal_buffer_validate_usage(iree_hal_buffer_usage_t allowed_usage,
     iree_bitfield_string_temp_t temp0, temp1;
     iree_string_view_t allowed_usage_str =
         iree_hal_buffer_usage_format(allowed_usage, &temp0);
+    fprintf(stderr, "[DBG] usage allowed=0x%x required=0x%x\n",
+        (unsigned)allowed_usage, (unsigned)required_usage);
+    fflush(stderr);
     iree_string_view_t required_usage_str =
         iree_hal_buffer_usage_format(required_usage, &temp1);
     return iree_make_status(
@@ -878,6 +885,12 @@ IREE_API_EXPORT iree_status_t iree_hal_buffer_prepare_map_range(
   const bool is_persistent =
       iree_all_bits_set(mapping_mode, IREE_HAL_MAPPING_MODE_PERSISTENT);
   if (is_persistent) {
+    fprintf(stderr, "[DBG] map_persistent buf=%p dev=%p type=0x%x usage=0x%x\n",
+            (void*)buffer,
+            (void*)iree_hal_buffer_allocation_placement(buffer).device,
+            (unsigned)iree_hal_buffer_memory_type(buffer),
+            (unsigned)iree_hal_buffer_allowed_usage(buffer));
+    fflush(stderr);
     IREE_RETURN_AND_END_ZONE_IF_ERROR(z0,
                                       iree_hal_buffer_validate_memory_type(
                                           iree_hal_buffer_memory_type(buffer),

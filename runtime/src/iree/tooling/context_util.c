@@ -6,8 +6,11 @@
 
 #include "iree/tooling/context_util.h"
 
+iree_hal_device_group_t* iree_tooling_experimental_device_group = NULL;
+
 #include <memory.h>
 #include <string.h>
+#include <stdio.h>
 
 #include "iree/async/frontier_tracker.h"
 #include "iree/async/util/proactor_pool.h"
@@ -185,6 +188,8 @@ static iree_status_t iree_hal_module_device_allocator_select_specific(
     iree_hal_memory_type_t memory_types, iree_hal_buffer_usage_t buffer_usage,
     iree_hal_module_device_allocator_select_flags_t flags,
     iree_host_size_t* out_selection) {
+    
+  
   for (iree_host_size_t i = 0; i < device_count; ++i) {
     if (devices[i].device == user_data) {
       *out_selection = i;
@@ -463,6 +468,9 @@ static iree_status_t iree_tooling_load_hal_async_module(
     iree_hal_device_retain(device);
     device_allocator = iree_hal_device_allocator(device);
     iree_hal_allocator_retain(device_allocator);
+    // EXPERIMENT: expose the group so run_module can place inputs per device.
+    iree_hal_device_group_retain(module_device_group);
+    iree_tooling_experimental_device_group = module_device_group;
   }
 
   // Create HAL module wrapping the device group.

@@ -1,3 +1,5 @@
+#include <execinfo.h>
+#include <stdio.h>
 // Copyright 2023 The IREE Authors
 //
 // Licensed under the Apache License v2.0 with LLVM Exceptions.
@@ -288,6 +290,30 @@ static iree_status_t iree_hal_vulkan_native_allocator_commit_and_wrap(
       &allocator->device_props, &allocator->memory_props, params,
       /*allowed_type_indices=*/requirements.memoryTypeBits,
       &memory_type_index));
+  // BRIDGE: report the memory type the buffer actually landed in. On UMA parts
+  // (e.g. 890M) DEVICE_LOCAL memory is frequently HOST_VISIBLE too; without
+  // these bits other devices (local-task) reject the buffer at dispatch.
+  iree_hal_memory_type_t actual_type = params->type;
+  iree_hal_buffer_usage_t actual_usage = params->usage;
+  {
+    VkMemoryPropertyFlags props =
+        allocator->memory_props.memoryTypes[memory_type_index].propertyFlags;
+    if (props & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+      actual_type |= IREE_HAL_MEMORY_TYPE_HOST_VISIBLE;
+    if (props & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+      actual_type |= IREE_HAL_MEMORY_TYPE_HOST_COHERENT;
+    if (props & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
+      actual_type |= IREE_HAL_MEMORY_TYPE_HOST_CACHED;
+
+    if ((props & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+        (props & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+      actual_usage |= IREE_HAL_BUFFER_USAGE_MAPPING_PERSISTENT;
+    }
+
+    fprintf(stderr, "[BR] vulkan alloc idx=%u vkprops=0x%x -> hal_type=0x%x usage=0x%x\n",
+            memory_type_index, (unsigned)props, (unsigned)actual_type,
+            (unsigned)actual_usage);
+  }
 
   if (use_sparse_allocation) {
     // Use sparse allocation for this buffer in order to exceed the maximum
@@ -295,7 +321,7 @@ static iree_status_t iree_hal_vulkan_native_allocator_commit_and_wrap(
     // to allocate such buffers (synchronously from raw allocations) but this
     // path is primarily used by large persistent variables and constants.
     return iree_hal_vulkan_sparse_buffer_create_bound_sync(
-        placement, params->type, params->access, params->usage, allocation_size,
+        placement, actual_type, params->access, actual_usage, allocation_size,
         /*byte_offset=*/0,
         /*byte_length=*/allocation_size, logical_device, queue, handle,
         requirements, memory_type_index,
@@ -333,7 +359,7 @@ static iree_status_t iree_hal_vulkan_native_allocator_commit_and_wrap(
       iree_hal_vulkan_native_allocator_native_buffer_release;
   internal_release_callback.user_data = NULL;
   iree_status_t status = iree_hal_vulkan_native_buffer_wrap(
-      placement, params->type, params->access, params->usage, allocation_size,
+      placement, actual_type, params->access, actual_usage, allocation_size,
       /*byte_offset=*/0,
       /*byte_length=*/allocation_size, logical_device, device_memory, handle,
       internal_release_callback, iree_hal_buffer_release_callback_null(),
@@ -586,7 +612,14 @@ static VkDeviceSize iree_hal_vulkan_native_allocator_align_external_ptr(
   VkDeviceSize desired_alignment = (VkDeviceSize)iree_device_size_lcm(
       (iree_device_size_t)requirements->alignment,
       (iree_device_size_t)allocator->min_imported_host_pointer_alignment);
-  VkDeviceSize unaligned_addr = *((VkDeviceSize*)host_ptr);
+
+  // [BR] Read the pointer value as a pointer, then convert. The previous
+  // *((VkDeviceSize*)host_ptr) reinterpreted a void* object as uint64_t
+  // (strict-aliasing UB); with inlining it read 0 and produced a NULL import
+  // pointer (VK_ERROR_UNKNOWN from vkAllocateMemory).
+  VkDeviceSize unaligned_addr = (VkDeviceSize)(uintptr_t)(*host_ptr);
+
+
   VkDeviceSize aligned_addr =
       (unaligned_addr / desired_alignment) * desired_alignment;
   IREE_ASSERT(unaligned_addr >= aligned_addr);
@@ -626,7 +659,7 @@ static iree_status_t iree_hal_vulkan_native_allocator_import_host_buffer(
         "external host memory import is not supported on this device");
   }
 
-#if defined(IREE_PLATFORM_LINUX)
+#if 0 && defined(IREE_PLATFORM_LINUX)
   // First check if the memory is importable.
   // Some drivers incorrectly succeed when attempting to import already-mapped
   // memory: https://gitlab.freedesktop.org/mesa/mesa/-/issues/9251.
@@ -723,6 +756,10 @@ static iree_status_t iree_hal_vulkan_native_allocator_import_host_buffer(
       VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
   allocate_info.pNext = &import_host_ptr_info;
   VkDeviceMemory device_memory = VK_NULL_HANDLE;
+
+
+
+
   IREE_TRACE_ZONE_BEGIN_NAMED(z_c, "vkAllocateMemory");
   status = VK_RESULT_TO_STATUS(logical_device->syms()->vkAllocateMemory(
                                    *logical_device, &allocate_info,
@@ -789,6 +826,83 @@ static void iree_hal_vulkan_native_allocator_external_device_buffer_release(
                                             logical_device->allocator());
   }
 }
+
+
+static iree_status_t iree_hal_vulkan_native_allocator_import_device_buffer(
+    iree_hal_allocator_t* IREE_RESTRICT base_allocator,
+    const iree_hal_buffer_params_t* IREE_RESTRICT params,
+    iree_hal_external_buffer_t* IREE_RESTRICT external_buffer,
+    iree_hal_buffer_release_callback_t release_callback,
+    iree_hal_buffer_t** IREE_RESTRICT out_buffer);
+
+
+static iree_status_t iree_hal_vulkan_native_allocator_import_opaque_fd_buffer(
+    iree_hal_allocator_t* IREE_RESTRICT base_allocator,
+    const iree_hal_buffer_params_t* IREE_RESTRICT params,
+    iree_hal_external_buffer_t* IREE_RESTRICT external_buffer,
+    iree_hal_buffer_release_callback_t release_callback,
+    iree_hal_buffer_t** IREE_RESTRICT out_buffer) {
+  iree_hal_vulkan_native_allocator_t* allocator =
+      iree_hal_vulkan_native_allocator_cast(base_allocator);
+  VkDeviceHandle* logical_device = allocator->logical_device;
+
+  if (!logical_device->enabled_extensions().external_memory_fd) {
+    return iree_make_status(IREE_STATUS_UNAVAILABLE,
+                            "VK_KHR_external_memory_fd not enabled");
+  }
+  int fd = external_buffer->handle.opaque_fd.fd;
+  if (IREE_UNLIKELY(fd < 0)) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "invalid fd");
+  }
+
+  // dma-buf imports must use the dma-buf handle type; the driver tells us
+  // which memory types the fd is compatible with.
+  const VkExternalMemoryHandleTypeFlagBits handle_type =
+      logical_device->enabled_extensions().external_memory_dma_buf
+          ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+          : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+
+  VkMemoryFdPropertiesKHR fd_props = {};
+  fd_props.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
+  IREE_RETURN_IF_ERROR(VK_RESULT_TO_STATUS(
+      logical_device->syms()->vkGetMemoryFdPropertiesKHR(
+          *logical_device, handle_type, fd, &fd_props),
+      "vkGetMemoryFdPropertiesKHR"));
+
+  uint32_t memory_type_index = 0;
+  IREE_RETURN_IF_ERROR(iree_hal_vulkan_find_memory_type(
+      &allocator->device_props, &allocator->memory_props, params,
+      /*allowed_type_indices=*/fd_props.memoryTypeBits, &memory_type_index));
+
+  // The driver dups the fd during import, so ownership stays with the caller.
+  VkImportMemoryFdInfoKHR import_info = {};
+  import_info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+  import_info.handleType = handle_type;
+  import_info.fd = fd;
+
+  VkMemoryAllocateInfo allocate_info = {};
+  allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  allocate_info.pNext = &import_info;
+  allocate_info.allocationSize = external_buffer->size;
+  allocate_info.memoryTypeIndex = memory_type_index;
+
+  VkDeviceMemory device_memory = VK_NULL_HANDLE;
+  IREE_RETURN_IF_ERROR(VK_RESULT_TO_STATUS(
+      logical_device->syms()->vkAllocateMemory(*logical_device, &allocate_info,
+                                               logical_device->allocator(),
+                                               &device_memory),
+      "vkAllocateMemory"));
+
+  // Hand off to the device-allocation path, which wraps a VkBuffer around the
+  // VkDeviceMemory we just created.
+  iree_hal_external_buffer_t device_buffer = *external_buffer;
+  device_buffer.type = IREE_HAL_EXTERNAL_BUFFER_TYPE_DEVICE_ALLOCATION;
+  device_buffer.handle.device_allocation.ptr = (uint64_t)device_memory;
+  return iree_hal_vulkan_native_allocator_import_device_buffer(
+      base_allocator, params, &device_buffer, release_callback, out_buffer);
+}
+
+
 
 static iree_status_t iree_hal_vulkan_native_allocator_import_device_buffer(
     iree_hal_allocator_t* IREE_RESTRICT base_allocator,
@@ -865,6 +979,14 @@ static iree_status_t iree_hal_vulkan_native_allocator_import_buffer(
       return iree_hal_vulkan_native_allocator_import_device_buffer(
           base_allocator, params, external_buffer, release_callback,
           out_buffer);
+
+
+    case IREE_HAL_EXTERNAL_BUFFER_TYPE_OPAQUE_FD:
+      return iree_hal_vulkan_native_allocator_import_opaque_fd_buffer(
+          base_allocator, params, external_buffer, release_callback,
+          out_buffer);
+
+
     default:
       return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
                               "external buffer type import not implemented");

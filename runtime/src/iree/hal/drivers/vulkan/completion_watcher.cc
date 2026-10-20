@@ -340,6 +340,7 @@ static int iree_hal_vulkan_completion_watcher_thread_main(void* param) {
           continue;
         }
 
+          fprintf(stderr, "[BR] vk complete sem=%p value=%llu t=%.3fms\n", (void*)watcher->active_entries[i].semaphore, (unsigned long long)value, iree_time_now() / 1e6); fflush(stderr);
         if (value >= watcher->active_entries[i].target_value) {
           // Completed. Sync host-side async timeline and dispatch timepoints.
           iree_async_semaphore_t* async_sem =

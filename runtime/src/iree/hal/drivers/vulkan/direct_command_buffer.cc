@@ -1,3 +1,4 @@
+#include <stdio.h>
 // Copyright 2019 The IREE Authors
 //
 // Licensed under the Apache License v2.0 with LLVM Exceptions.
@@ -782,15 +783,176 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_dispatch_bind(
   return iree_ok_status();
 }
 
+iree_hal_buffer_ref_t g_last_bindings[8];
+iree_host_size_t g_last_binding_count = 0;
 static iree_status_t iree_hal_vulkan_direct_command_buffer_dispatch(
     iree_hal_command_buffer_t* base_command_buffer,
     iree_hal_executable_t* executable,
     iree_hal_executable_export_ordinal_t export_ordinal,
     const iree_hal_dispatch_config_t config, iree_const_byte_span_t constants,
     iree_hal_buffer_ref_list_t bindings, iree_hal_dispatch_flags_t flags) {
+  g_last_binding_count = bindings.count < 8 ? bindings.count : 8;
+  for (iree_host_size_t gi = 0; gi < g_last_binding_count; ++gi) g_last_bindings[gi] = bindings.values[gi];
+  fprintf(stderr, "[BR] vk dispatch entry=%u wg=[%u %u %u] bindings=%zu\n", (unsigned)export_ordinal,
+          (unsigned)config.workgroup_count[0], (unsigned)config.workgroup_count[1],
+          (unsigned)config.workgroup_count[2], (size_t)bindings.count);
+  for (iree_host_size_t bi = 0; bi < bindings.count; ++bi) {
+    iree_hal_buffer_ref_t ref = bindings.values[bi];
+    iree_hal_buffer_mapping_t m;
+    iree_status_t ms = iree_hal_buffer_map_range(ref.buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+        IREE_HAL_MEMORY_ACCESS_READ, ref.offset, 16, &m);
+    if (iree_status_is_ok(ms)) {
+      const float* f = (const float*)m.contents.data;
+      fprintf(stderr, "[BR] vk dispatch binding[%zu] buf=%p dev=%p type=0x%x first=[%g %g %g %g]\n",
+              (size_t)bi, (void*)ref.buffer, (void*)iree_hal_buffer_allocation_placement(ref.buffer).device,
+              (unsigned)iree_hal_buffer_memory_type(ref.buffer), f[0], f[1], f[2], f[3]);
+      iree_hal_buffer_unmap_range(&m);
+    } else {
+      fprintf(stderr, "[BR] vk dispatch binding[%zu] buf=%p type=0x%x unmappable\n",
+              (size_t)bi, (void*)ref.buffer, (unsigned)iree_hal_buffer_memory_type(ref.buffer));
+      iree_status_ignore(ms);
+    }
+    fflush(stderr);
+  }
   iree_hal_vulkan_direct_command_buffer_t* command_buffer =
       iree_hal_vulkan_direct_command_buffer_cast(base_command_buffer);
 
+  // BRIDGE: bindings owned by another device (e.g. amdxdna BOs) are not
+  // VkBuffers. Export them as dma-buf fds and import as VkDeviceMemory so the
+  // dispatch can bind them directly. Without this the buffer_handle cast in
+  // descriptor_set_arena reads garbage and the shader silently sees zeros.
+  iree_hal_buffer_ref_t patched_bindings[8];
+  bool any_imported = false;
+  if (bindings.count <= 8) {
+    for (iree_host_size_t bi = 0; bi < bindings.count; ++bi) {
+      patched_bindings[bi] = bindings.values[bi];
+      iree_hal_buffer_t* src = bindings.values[bi].buffer;
+      if (!src) continue;
+      iree_hal_buffer_t* allocated = iree_hal_buffer_allocated_buffer(src);
+      iree_hal_device_t* src_device =
+          iree_hal_buffer_allocation_placement(allocated).device;
+
+
+      iree_hal_external_buffer_t ext;
+      memset(&ext, 0, sizeof(ext));
+      iree_status_t s = iree_ok_status();
+      if (!src_device) {
+        // Host (heap) buffers carry no owning device in their placement, so
+        // there is no allocator to ask for an export. Map the buffer to get
+        // its host pointer and import it as HOST_ALLOCATION. Vulkan-allocated
+        // buffers always record their device, so they never reach here.
+        iree_hal_buffer_mapping_t mapping;
+
+
+        // READ|WRITE only: ACCESS_ALL includes DISCARD, and heap buffers in
+        // debug builds scribble 0xCD over the range when mapped for discard
+        // (buffer_heap.c), which wiped the input data before the GPU read it.
+        s = iree_hal_buffer_map_range(
+            allocated, IREE_HAL_MAPPING_MODE_PERSISTENT,
+            IREE_HAL_MEMORY_ACCESS_READ | IREE_HAL_MEMORY_ACCESS_WRITE, 0,
+            IREE_HAL_WHOLE_BUFFER, &mapping);
+
+            
+        if (iree_status_is_ok(s)) {
+          ext.type = IREE_HAL_EXTERNAL_BUFFER_TYPE_HOST_ALLOCATION;
+          ext.flags = IREE_HAL_EXTERNAL_BUFFER_FLAG_NONE;
+          ext.size = iree_hal_buffer_allocation_size(allocated);
+          ext.handle.host_allocation.ptr = mapping.contents.data;
+          // Heap unmap is a no-op; the pointer stays valid while the buffer
+          // lives, and the binding keeps the buffer alive for the dispatch.
+          iree_hal_buffer_unmap_range(&mapping);
+        }
+      } else {
+        iree_hal_allocator_t* src_allocator =
+            iree_hal_device_allocator(src_device);
+        if (src_allocator == command_buffer->device_allocator) continue;
+        // Ask the owner for a handle this allocator can import. Try the
+        // cheapest-to-share types in order:
+        //  1. OPAQUE_FD (dma-buf): device allocations such as amdxdna BOs.
+        //  2. HOST_ALLOCATION: host allocations such as local-task buffers;
+        //     imported via VK_EXT_external_memory_host.
+        s = iree_hal_allocator_export_buffer(
+            src_allocator, allocated, IREE_HAL_EXTERNAL_BUFFER_TYPE_OPAQUE_FD,
+            IREE_HAL_EXTERNAL_BUFFER_FLAG_NONE, &ext);
+        if (!iree_status_is_ok(s)) {
+          iree_status_ignore(s);
+          memset(&ext, 0, sizeof(ext));
+          s = iree_hal_allocator_export_buffer(
+              src_allocator, allocated,
+              IREE_HAL_EXTERNAL_BUFFER_TYPE_HOST_ALLOCATION,
+              IREE_HAL_EXTERNAL_BUFFER_FLAG_NONE, &ext);
+        }
+      }
+      if (!iree_status_is_ok(s)) {
+        fprintf(stderr, "[BR] import binding[%zu] export failed\n", (size_t)bi);
+        fflush(stderr);
+        iree_status_ignore(s);
+        continue;
+      }
+
+      
+      iree_hal_buffer_params_t params;
+      memset(&params, 0, sizeof(params));
+      params.type = iree_hal_buffer_memory_type(allocated);
+      params.access = IREE_HAL_MEMORY_ACCESS_ALL;
+
+
+      // Imported memory is host-visible (host pointer or HOST_VISIBLE dma-buf),
+      // so allow persistent mapping as well; host-side copies (e.g. tooling
+      // output transfer via block_command_buffer) map with PERSISTENT mode.
+      params.usage = IREE_HAL_BUFFER_USAGE_DISPATCH_STORAGE |
+                     IREE_HAL_BUFFER_USAGE_TRANSFER |
+                     IREE_HAL_BUFFER_USAGE_MAPPING |
+                     IREE_HAL_BUFFER_USAGE_MAPPING_PERSISTENT;
+
+                     
+      params.queue_affinity = IREE_HAL_QUEUE_AFFINITY_ANY;
+      iree_hal_buffer_t* imported = NULL;
+      s = iree_hal_allocator_import_buffer(
+          command_buffer->device_allocator, params, &ext,
+          iree_hal_buffer_release_callback_null(), &imported);
+
+
+
+      if (!iree_status_is_ok(s)) {
+        fprintf(stderr, "[BR] import binding[%zu] import failed type=%d",
+                (size_t)bi, (int)ext.type);
+        if (ext.type == IREE_HAL_EXTERNAL_BUFFER_TYPE_HOST_ALLOCATION) {
+          fprintf(stderr, " ptr=%p ptr%%4096=%zu size=%zu size%%4096=%zu",
+                  ext.handle.host_allocation.ptr,
+                  (size_t)((uintptr_t)ext.handle.host_allocation.ptr % 4096),
+                  (size_t)ext.size, (size_t)(ext.size % 4096));
+        }
+        fprintf(stderr, "\n[BR]   reason: ");
+        iree_status_fprint(stderr, s);
+        fprintf(stderr, "\n");
+        fflush(stderr);
+        iree_status_ignore(s);
+        continue;
+      }
+
+
+      if (ext.type == IREE_HAL_EXTERNAL_BUFFER_TYPE_OPAQUE_FD) {
+        fprintf(stderr, "[BR] import binding[%zu] ok fd=%d\n", (size_t)bi,
+                ext.handle.opaque_fd.fd);
+      } else {
+        fprintf(stderr, "[BR] import binding[%zu] ok host_ptr=%p\n",
+                (size_t)bi, ext.handle.host_allocation.ptr);
+      }
+
+
+
+      fflush(stderr);
+      IREE_RETURN_IF_ERROR(iree_hal_resource_set_insert(
+          command_buffer->resource_set, 1, &imported));
+      iree_hal_buffer_release(imported);
+      patched_bindings[bi].buffer = imported;
+      any_imported = true;
+    }
+    if (any_imported) {
+      bindings.values = patched_bindings;
+    }
+  }
   // TODO: we can support CUSTOM_DIRECT_ARGUMENTS pretty easily. Indirect
   // arguments may require a uniform buffer and shader changes.
   if (iree_hal_dispatch_uses_custom_arguments(flags)) {

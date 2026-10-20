@@ -112,6 +112,13 @@ static iree_status_t iree_hal_vulkan_native_buffer_map_range(
   IREE_RETURN_IF_ERROR(iree_hal_buffer_validate_memory_type(
       iree_hal_buffer_memory_type(base_buffer),
       IREE_HAL_MEMORY_TYPE_HOST_VISIBLE));
+  fprintf(stderr, "[DBG] vkmap buf=%p dev=%p type=0x%x usage=0x%x mode=0x%x\n",
+          (void*)base_buffer,
+          (void*)iree_hal_buffer_allocation_placement(base_buffer).device,
+          (unsigned)iree_hal_buffer_memory_type(base_buffer),
+          (unsigned)iree_hal_buffer_allowed_usage(base_buffer),
+          (unsigned)mapping_mode);
+  fflush(stderr);
   IREE_RETURN_IF_ERROR(iree_hal_buffer_validate_usage(
       iree_hal_buffer_allowed_usage(base_buffer),
       mapping_mode == IREE_HAL_MAPPING_MODE_PERSISTENT

@@ -137,10 +137,24 @@ static void iree_hal_vulkan_populate_dispatch_memory_types(
     // type that is purely device-local but still want to ensure we pick
     // uncached over cached.
     int bit_count = iree_math_count_ones_u32(flags);
+    // TEMP: experiment. Prefer host-visible device-local memory so CPU/NPU can
+    // share the dispatch buffer without staging. Falls back to the original
+    // "fewest bits" rule when no host-visible type exists.
+    bool host_visible =
+        iree_all_bits_set(flags, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    bool best_host_visible =
+        least_bits_idx != -1 &&
+        iree_all_bits_set(
+            memory_props->memoryTypes[least_bits_idx].propertyFlags,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
     if (least_bits_idx == -1) {
       least_bits_count = bit_count;
       least_bits_idx = (int)i;
-    } else if (bit_count < least_bits_count) {
+    } else if (host_visible && !best_host_visible) {
+      least_bits_count = bit_count;
+      least_bits_idx = (int)i;
+    } else if (host_visible == best_host_visible &&
+               bit_count < least_bits_count) {
       least_bits_count = bit_count;
       least_bits_idx = (int)i;
     }
@@ -296,6 +310,13 @@ iree_status_t iree_hal_vulkan_populate_memory_types(
     return iree_make_status(IREE_STATUS_INTERNAL,
                             "transfer-compatible memory types not found");
   }
+  fprintf(stderr,                                    // ← 여기
+          "[DBG] memtypes dispatch=%d bulk_up=%d bulk_dn=%d stg_up=%d stg_dn=%d\n",
+          out_memory_types->dispatch_idx, out_memory_types->bulk_upload_idx,
+          out_memory_types->bulk_download_idx,
+          out_memory_types->staging_upload_idx,
+          out_memory_types->staging_download_idx);
+
   return iree_ok_status();
 }
 

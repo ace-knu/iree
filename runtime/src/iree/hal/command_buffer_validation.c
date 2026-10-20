@@ -118,6 +118,16 @@ static iree_status_t iree_hal_command_buffer_validate_binding_requirements(
   IREE_RETURN_IF_ERROR(iree_hal_command_buffer_validate_buffer_compatibility(
       command_buffer, validation_state, binding.buffer,
       requirements.required_compatibility, requirements.usage));
+  if (!iree_all_bits_set(iree_hal_buffer_allowed_usage(binding.buffer),
+                         requirements.usage)) {
+    fprintf(stderr, "[DBG] cb_validate buf=%p dev=%p type=0x%x allowed=0x%x req=0x%x\n",
+            (void*)binding.buffer,
+            (void*)iree_hal_buffer_allocation_placement(binding.buffer).device,
+            (unsigned)iree_hal_buffer_memory_type(binding.buffer),
+            (unsigned)iree_hal_buffer_allowed_usage(binding.buffer),
+            (unsigned)requirements.usage);
+    fflush(stderr);
+  }
 
   // Verify buffer compatibility.
   IREE_RETURN_IF_ERROR(iree_hal_buffer_validate_usage(

@@ -213,6 +213,16 @@ iree_hal_vulkan_populate_enabled_device_extensions(
     } else if (strcmp(extension_name,
                       VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) == 0) {
       extensions.external_memory_host = true;
+
+
+    } else if (strcmp(extension_name,
+                      VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) == 0) {
+      extensions.external_memory_fd = true;
+    } else if (strcmp(extension_name,
+                      VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME) == 0) {
+      extensions.external_memory_dma_buf = true;
+
+      
     } else if (strcmp(extension_name,
                       VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) == 0) {
       extensions.buffer_device_address = true;

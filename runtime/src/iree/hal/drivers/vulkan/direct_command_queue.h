@@ -35,7 +35,8 @@ class DirectCommandQueue final : public CommandQueue {
   iree_status_t TranslateBatchInfo(
       const iree_hal_vulkan_submission_batch_t* batch,
       VkSubmitInfo* submit_info,
-      VkTimelineSemaphoreSubmitInfo* timeline_submit_info, Arena* arena);
+      VkTimelineSemaphoreSubmitInfo* timeline_submit_info, Arena* arena,
+      bool* out_has_foreign_signal);
 };
 
 }  // namespace vulkan

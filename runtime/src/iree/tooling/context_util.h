@@ -106,6 +106,9 @@ iree_status_t iree_tooling_create_instance(iree_allocator_t host_allocator,
 //
 // If multiple devices are created the one returned (and its corresponding
 // allocator) are considered the 'lead' device for bookkeeping purposes.
+// EXPERIMENT: device group created from --device flags (NULL if none).
+extern iree_hal_device_group_t* iree_tooling_experimental_device_group;
+
 iree_status_t iree_tooling_create_context_from_flags(
     iree_vm_instance_t* instance, iree_host_size_t user_module_count,
     iree_vm_module_t** user_modules, iree_string_view_t default_device_uri,
