@@ -141,7 +141,7 @@ static iree_zone_id_t iree_tracing_zone_begin(
   // time.
   iree_trace_zone_t* zone = &_thread.stack[zone_id];
   zone->name_length = iree_min(name_length, IREE_ARRAYSIZE(zone->name));
-  memcpy(zone->name, name, name_length);
+  memcpy(zone->name, name, zone->name_length);
   zone->start_timestamp_ns = iree_platform_time_now();
 #endif  // IREE_TRACING_CONSOLE_TIMING
 
@@ -180,11 +180,12 @@ void iree_tracing_zone_end(iree_zone_id_t zone_id) {
   uint64_t duration_ns = end_timestamp_ns - zone->start_timestamp_ns;
   fprintf(_console.file,
           "[%08" PRIX64 "][%.*s%*s] %*s◄ %.*s t = %" PRIu64 "ns / %" PRIu64
-          "us / %gms\n",
+          "us / %gms @ %" PRIu64 "ns\n",
           iree_thread_id(), (int)_thread.name_length, _thread.name,
           (int)(IREE_TRACING_MAX_THREAD_LENGTH - _thread.name_length), "",
           (zone_id - 1), "", (int)zone->name_length, zone->name, duration_ns,
-          duration_ns / 1000, duration_ns / 1000000.0f);
+          duration_ns / 1000, duration_ns / 1000000.0f,
+          zone->start_timestamp_ns);
 #if IREE_TRACING_CONSOLE_FLUSH
   fflush(_console.file);
 #endif  // IREE_TRACING_CONSOLE_FLUSH
