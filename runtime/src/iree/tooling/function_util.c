@@ -5,7 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/tooling/function_util.h"
-
+#include <stdio.h>
 #include "iree/modules/hal/module.h"
 
 iree_status_t iree_tooling_append_async_fences(
@@ -16,6 +16,8 @@ iree_status_t iree_tooling_append_async_fences(
 
   iree_string_view_t model = iree_vm_function_lookup_attr_by_name(
       &function, IREE_SV("iree.abi.model"));
+  fprintf(stderr, "[DBG] abi.model='%.*s'\n", (int)model.size, model.data);
+  fflush(stderr);
   if (!iree_string_view_equal(model, IREE_SV("coarse-fences"))) {
     // Ignore unknown models - the user may have provided their own fences.
     IREE_TRACE_ZONE_END(z0);
@@ -42,6 +44,9 @@ iree_status_t iree_tooling_append_async_fences(
   iree_hal_fence_t* signal_fence = NULL;
   iree_status_t status = iree_hal_fence_create_at(
       semaphore, 1ull, iree_hal_device_host_allocator(device), &signal_fence);
+  fprintf(stderr, "[DBG] async_fence sem=%p dev=%p\n",
+          (void*)semaphore, (void*)device); 
+  fflush(stderr);
   iree_hal_semaphore_release(semaphore);
 
   // Append (wait, signal) fences.
@@ -94,6 +99,7 @@ static iree_status_t iree_tooling_setup_buffer_transfer(
               target_allocator, target_params,
               iree_hal_buffer_allocation_size(source_buffer), &target_buffer));
 
+         
   iree_status_t status = iree_hal_command_buffer_copy_buffer(
       command_buffer,
       iree_hal_make_buffer_ref(source_buffer, 0,
@@ -128,6 +134,8 @@ static iree_status_t iree_tooling_submit_transfer(
                                   IREE_HAL_SEMAPHORE_FLAG_DEFAULT, &semaphore));
     status = iree_hal_fence_create_at(
         semaphore, 1ull, iree_hal_device_host_allocator(device), &signal_fence);
+    fprintf(stderr, "[DBG] transfer_fence sem=%p dev=%p\n",
+            (void*)semaphore, (void*)device);
     iree_hal_semaphore_release(semaphore);
   } else {
     iree_hal_fence_retain(signal_fence);

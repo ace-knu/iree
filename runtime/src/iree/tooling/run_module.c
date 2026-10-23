@@ -6,6 +6,9 @@
 
 #include "iree/tooling/run_module.h"
 
+#include <stdlib.h>
+#include <string.h>
+
 #include "iree/base/api.h"
 #include "iree/base/tooling/flags.h"
 #include "iree/hal/api.h"
@@ -44,6 +47,14 @@ IREE_FLAG_LIST(
     "\n"
     "Each occurrence of the flag indicates an input in the order they were\n"
     "specified on the command line.");
+
+IREE_FLAG_LIST(
+    string, input_device,
+    "EXPERIMENT: index (in --device order) of the device the i-th input\n"
+    "should be placed on. Inputs without an entry stay on the lead device.\n"
+    "When no --input_device is given, the compiler-recorded function\n"
+    "reflection amdaie.input_devices (device IDs) is used instead.\n"
+    "  e.g.: --input_device=1 --input_device=1 --input_device=0");
 
 IREE_FLAG_LIST(
     string, output,
@@ -207,6 +218,32 @@ static iree_status_t iree_tooling_annotate_status_with_function_decl(
   return base_status;
 }
 
+// 3DEV: Finds the first device in |group| whose hal.device.id matches the
+// pattern "<id>*" (the same query the compiled module uses to bind its
+// @__device_N globals, e.g. "local" -> local-task). Returns false if none.
+static bool iree_tooling_find_device_by_id(iree_hal_device_group_t* group,
+                                           iree_string_view_t id,
+                                           iree_host_size_t* out_index) {
+  char pattern[64];
+  snprintf(pattern, sizeof(pattern), "%.*s*", (int)id.size, id.data);
+  for (iree_host_size_t i = 0; i < iree_hal_device_group_device_count(group);
+       ++i) {
+    int64_t match = 0;
+    iree_status_t status = iree_hal_device_query_i64(
+        iree_hal_device_group_device_at(group, i), IREE_SV("hal.device.id"),
+        iree_make_cstring_view(pattern), &match);
+    if (!iree_status_is_ok(status)) {
+      iree_status_ignore(status);
+      continue;
+    }
+    if (match) {
+      *out_index = i;
+      return true;
+    }
+  }
+  return false;
+}
+
 static iree_status_t iree_tooling_run_function(
     iree_vm_context_t* context, iree_vm_function_t function,
     iree_hal_device_t* device, iree_hal_allocator_t* device_allocator,
@@ -235,6 +272,150 @@ static iree_status_t iree_tooling_run_function(
         iree_tooling_parse_variants(arguments_cconv, FLAG_input_list(), device,
                                     device_allocator, host_allocator, &inputs),
         "parsing function inputs");
+  }
+
+  // EXPERIMENT: relocate inputs to per-input devices.
+  // 3DEV: explicit --input_device wins; without it the compiler-recorded
+  // reflection amdaie.input_devices ("amdxdna,,vulkan|local") is used:
+  //   ""  never imported -> left alone
+  //   "?" no device all importers can read -> error, never guessed
+  //   "a|b" tie -> the lead if listed, else the first candidate
+  // Every listed device ID must be among --device (error otherwise).
+  bool input_device_from_flag = FLAG_input_device_list().count > 0;
+  iree_string_view_t input_device_spec =
+      input_device_from_flag
+          ? iree_string_view_empty()
+          : iree_vm_function_lookup_attr_by_name(
+                &function, IREE_SV("amdaie.input_devices"));
+  iree_host_size_t input_device_count = FLAG_input_device_list().count;
+  if (!input_device_from_flag && !iree_string_view_is_empty(input_device_spec)) {
+    input_device_count = 1;
+    for (iree_host_size_t c = 0; c < input_device_spec.size; ++c) {
+      if (input_device_spec.data[c] == ',') ++input_device_count;
+    }
+  }
+  if (iree_status_is_ok(status) &&
+      (input_device_from_flag ||
+       !iree_string_view_is_empty(input_device_spec)) &&
+      iree_tooling_experimental_device_group != NULL) {
+    iree_hal_buffer_params_t relocate_params = {
+        .usage = IREE_HAL_BUFFER_USAGE_DEFAULT | IREE_HAL_BUFFER_USAGE_MAPPING,
+        .access = IREE_HAL_MEMORY_ACCESS_ALL,
+        .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL |
+                IREE_HAL_MEMORY_TYPE_HOST_VISIBLE,
+        .queue_affinity = IREE_HAL_QUEUE_AFFINITY_ANY,
+        .min_alignment = 0,
+    };
+    iree_hal_device_group_t* group = iree_tooling_experimental_device_group;
+    iree_string_view_t remaining_spec = input_device_spec;
+    for (iree_host_size_t i = 0;
+         i < input_device_count && iree_status_is_ok(status); ++i) {
+      iree_host_size_t idx = 0;
+      if (input_device_from_flag) {
+        iree_string_view_t sv = FLAG_input_device_list().values[i];
+        if (sv.size == 0 || i >= iree_vm_list_size(inputs)) continue;
+        idx = (iree_host_size_t)atoi(sv.data);
+        if (idx >= iree_hal_device_group_device_count(group)) {
+          status = iree_make_status(IREE_STATUS_OUT_OF_RANGE,
+                                    "--input_device[%zu]=%zu out of range", i,
+                                    idx);
+          break;
+        }
+      } else {
+        iree_string_view_t entry = iree_string_view_empty();
+        iree_string_view_split(remaining_spec, ',', &entry, &remaining_spec);
+        if (entry.size == 0 || i >= iree_vm_list_size(inputs)) continue;
+        if (iree_string_view_equal(entry, IREE_SV("?"))) {
+          status = iree_make_status(
+              IREE_STATUS_FAILED_PRECONDITION,
+              "input %zu: the compiler found no device that all of its "
+              "importers can read (amdaie.input_devices entry '?'); specify "
+              "its placement with --input_device",
+              i);
+          break;
+        }
+        bool lead_listed = false;
+        bool have_first = false;
+        iree_host_size_t first_idx = 0;
+        iree_string_view_t candidates = entry;
+        while (candidates.size > 0) {
+          iree_string_view_t candidate = iree_string_view_empty();
+          iree_string_view_split(candidates, '|', &candidate, &candidates);
+          iree_host_size_t candidate_idx = 0;
+          if (!iree_tooling_find_device_by_id(group, candidate,
+                                              &candidate_idx)) {
+            status = iree_make_status(
+                IREE_STATUS_NOT_FOUND,
+                "input %zu: device '%.*s' from amdaie.input_devices is not "
+                "among the --device list; add it or specify --input_device",
+                i, (int)candidate.size, candidate.data);
+            break;
+          }
+          if (!have_first) {
+            first_idx = candidate_idx;
+            have_first = true;
+          }
+          if (iree_hal_device_group_device_at(group, candidate_idx) == device) {
+            lead_listed = true;
+          }
+        }
+        if (!iree_status_is_ok(status)) break;
+        if (lead_listed) {
+          fprintf(stderr, "[BR] input[%zu] -> lead (reflection '%.*s')\n", i,
+                  (int)entry.size, entry.data);
+          fflush(stderr);
+          continue;
+        }
+        idx = first_idx;
+      }
+      iree_hal_device_t* target = iree_hal_device_group_device_at(group, idx);
+      if (target == device) continue;  // already on the lead
+      iree_vm_variant_t v = iree_vm_variant_empty();
+      status = iree_vm_list_get_variant_assign(inputs, i, &v);
+      iree_hal_buffer_view_t* src_view =
+          iree_status_is_ok(status) ? iree_hal_buffer_view_deref(v.ref) : NULL;
+      if (iree_status_is_ok(status) && !src_view) {
+        status = iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                  "input %zu is not a buffer view", i);
+      }
+      iree_hal_buffer_t* dst = NULL;
+      iree_device_size_t len = 0;
+      if (iree_status_is_ok(status)) {
+        len = iree_hal_buffer_byte_length(iree_hal_buffer_view_buffer(src_view));
+        status = iree_hal_allocator_allocate_buffer(
+            iree_hal_device_allocator(target), relocate_params, len, &dst);
+      }
+      if (iree_status_is_ok(status)) {
+        iree_hal_buffer_mapping_t sm, dm;
+        status = iree_hal_buffer_map_range(
+            iree_hal_buffer_view_buffer(src_view), IREE_HAL_MAPPING_MODE_SCOPED,
+            IREE_HAL_MEMORY_ACCESS_READ, 0, len, &sm);
+        if (iree_status_is_ok(status)) {
+          status = iree_hal_buffer_map_range(dst, IREE_HAL_MAPPING_MODE_SCOPED,
+                                             IREE_HAL_MEMORY_ACCESS_DISCARD_WRITE,
+                                             0, len, &dm);
+          if (iree_status_is_ok(status)) {
+            memcpy(dm.contents.data, sm.contents.data, (size_t)len);
+            status = iree_hal_buffer_unmap_range(&dm);
+          }
+          iree_status_ignore(iree_hal_buffer_unmap_range(&sm));
+        }
+      }
+      iree_hal_buffer_view_t* dst_view = NULL;
+      if (iree_status_is_ok(status)) {
+        status = iree_hal_buffer_view_create_like(dst, src_view, host_allocator,
+                                                  &dst_view);
+      }
+      if (iree_status_is_ok(status)) {
+        iree_vm_ref_t ref = iree_hal_buffer_view_move_ref(dst_view);
+        status = iree_vm_list_set_ref_move(inputs, i, &ref);
+      }
+      iree_hal_buffer_release(dst);
+      fprintf(stderr, "[BR] input[%zu] -> device %zu (%s, %s)\n", i, idx,
+              iree_status_is_ok(status) ? "ok" : "FAILED",
+              input_device_from_flag ? "flag" : "reflection");
+      fflush(stderr);
+    }
   }
 
   // If the function is async add fences so we can invoke it synchronously.

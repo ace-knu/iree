@@ -351,6 +351,11 @@ IREE_VM_ABI_EXPORT(iree_hal_module_allocator_select,  //
     IREE_RETURN_IF_ERROR(
         iree_hal_device_check_deref(args->a3[0].r0, &first_device));
     rets->r0 = iree_hal_device_retain_ref(first_device);
+    fprintf(stderr, "[DBG] alloc_select: no policy, pairs=%d -> first\n",
+            (int)args->a3_count);
+    fflush(stderr);
+
+
     rets->i1 = args->a3[0].i1;
     return iree_ok_status();
   }
@@ -368,12 +373,21 @@ IREE_VM_ABI_EXPORT(iree_hal_module_allocator_select,  //
         iree_hal_device_check_deref(args->a3[i].r0, &pairs[i].device));
     pairs[i].queue_affinity = (iree_hal_queue_affinity_t)args->a3[i].i1;
   }
-
+  for (iree_host_size_t i = 0; i < pair_count; ++i) {
+    fprintf(stderr, "[DBG] alloc_select cand[%d] dev=%p qa=0x%llx\n",
+            (int)i, (void*)pairs[i].device,
+            (unsigned long long)pairs[i].queue_affinity);
+  }
+  fflush(stderr);
   iree_host_size_t selection = 0;
   IREE_RETURN_IF_ERROR(state->device_policy.allocator_select.fn(
       state->device_policy.allocator_select.user_data, pair_count, pairs,
       memory_types, buffer_usage, flags, &selection));
 
+  fprintf(stderr, "[DBG] alloc_select: policy pairs=%d -> %d\n",
+          (int)pair_count, (int)selection);
+  fflush(stderr); 
+      
   rets->r0 = iree_hal_device_retain_ref(pairs[selection].device);
   rets->i1 = pairs[selection].queue_affinity;
   return iree_ok_status();
@@ -1661,6 +1675,12 @@ IREE_VM_ABI_EXPORT(iree_hal_module_fence_create,  //
                    rI, r) {
   iree_hal_device_t* device = NULL;
   IREE_RETURN_IF_ERROR(iree_hal_device_check_deref(args->r0, &device));
+  {
+    iree_string_view_t dev_id = iree_hal_device_id(device);
+    fprintf(stderr, "[DBG] fence_create dev='%.*s' ptr=%p\n",
+            (int)dev_id.size, dev_id.data, (void*)device);
+    fflush(stderr);
+  }
   uint64_t fence_flags = args->i1;
   (void)fence_flags;
 

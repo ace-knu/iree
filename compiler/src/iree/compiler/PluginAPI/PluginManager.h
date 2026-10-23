@@ -140,6 +140,12 @@ public:
     }
   }
 
+  void extendStreamTransformPassPipeline(OpPassManager &passManager) override {
+    for (auto *s : initializedSessions) {
+      s->extendStreamTransformPassPipeline(passManager);
+    }
+  }
+
   // Populates the given list of HAL target devices for all initialized
   // plugins.
   void populateHALTargetDevices(IREE::HAL::TargetDeviceList &list);

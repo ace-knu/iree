@@ -243,7 +243,7 @@ namespace vulkan {
   DEV_PFN(EXCLUDED, vkGetImageSubresourceLayout)                        \
   DEV_PFN(EXCLUDED, vkGetImageViewHandleNVX)                            \
   DEV_PFN(EXCLUDED, vkGetMemoryFdKHR)                                   \
-  DEV_PFN(EXCLUDED, vkGetMemoryFdPropertiesKHR)                         \
+  DEV_PFN(OPTIONAL, vkGetMemoryFdPropertiesKHR)                         \
   DEV_PFN(OPTIONAL, vkGetMemoryHostPointerPropertiesEXT)                \
   DEV_PFN(EXCLUDED, vkGetPastPresentationTimingGOOGLE)                  \
   DEV_PFN(REQUIRED, vkGetPipelineCacheData)                             \

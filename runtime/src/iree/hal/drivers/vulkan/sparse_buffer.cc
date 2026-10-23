@@ -31,6 +31,10 @@ static iree_hal_vulkan_sparse_buffer_t* iree_hal_vulkan_sparse_buffer_cast(
   return (iree_hal_vulkan_sparse_buffer_t*)base_value;
 }
 
+bool iree_hal_vulkan_sparse_buffer_isa(iree_hal_buffer_t* buffer) {
+  return iree_hal_resource_is(buffer, &iree_hal_vulkan_sparse_buffer_vtable);
+}
+
 static iree_status_t iree_hal_vulkan_sparse_buffer_commit_sync(
     iree::hal::vulkan::VkDeviceHandle* logical_device, VkQueue queue,
     VkBuffer handle, VkMemoryRequirements requirements,

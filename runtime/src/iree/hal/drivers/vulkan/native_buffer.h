@@ -45,6 +45,9 @@ iree_status_t iree_hal_vulkan_native_buffer_wrap(
     iree_hal_buffer_release_callback_t user_release_callback,
     iree_allocator_t host_allocator, iree_hal_buffer_t** out_buffer);
 
+// 3DEV: Returns true if |buffer| is a native Vulkan buffer (not a subspan).
+bool iree_hal_vulkan_native_buffer_isa(iree_hal_buffer_t* buffer);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

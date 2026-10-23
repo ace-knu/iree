@@ -723,6 +723,16 @@ public:
     return containsBorrowedStorage(value, visited);
   }
 
+  // 3DEV: Returns true if the storage backing |value| has a placement this pass
+  // cannot change: it aliases an imported (caller-allocated) buffer or a
+  // constant/global resource allocated by an initializer. Eliding a transfer of
+  // such a value binds that storage directly on the result device. Values whose
+  // origin cannot be fully analyzed are conservatively treated as pinned.
+  bool hasPinnedPlacement(Value value) {
+    llvm::SmallPtrSet<Value, 8> visited;
+    return hasPinnedPlacement(value, visited);
+  }
+
   // Attempts to infer the affinity of |value| by walking up its defining ops
   // and checking for explicit affinity annotations or default affinities.
   // Returns nullptr if no affinity can be determined.
@@ -826,6 +836,62 @@ private:
         TraversalBehavior::DEFAULT);
     return foundBorrowedStorage ||
            traversalResult == TraversalResult::INCOMPLETE;
+  }
+
+  bool hasPinnedPlacement(Value value, llvm::SmallPtrSetImpl<Value> &visited) {
+    if (!visited.insert(value).second) {
+      return true;
+    }
+
+    bool foundPinned = false;
+    auto traversalResult = explorer.walkDefiningOps(
+        value,
+        [&](OpResult result) {
+          Operation *op = result.getOwner();
+
+          // Imported storage is allocated by the caller (consuming or not).
+          // Constants and globals are allocated by their initializers.
+          if (isa<IREE::Stream::TensorImportOp, IREE::Stream::AsyncConstantOp,
+                  IREE::Util::GlobalLoadOpInterface>(op)) {
+            foundPinned = true;
+            return WalkResult::interrupt();
+          }
+          if (auto resourceType =
+                  dyn_cast<IREE::Stream::ResourceType>(result.getType())) {
+            if (resourceType.getLifetime() ==
+                    IREE::Stream::Lifetime::Constant ||
+                resourceType.getLifetime() ==
+                    IREE::Stream::Lifetime::Variable) {
+              foundPinned = true;
+              return WalkResult::interrupt();
+            }
+          }
+
+          // Same-lifetime transfers and clones may be elided later by this
+          // pass, after which their source is what gets bound; follow them so
+          // the decision does not depend on elision order. Lifetime-changing
+          // ones are never elided and materialize new storage.
+          Value copySource;
+          if (auto transferOp = dyn_cast<IREE::Stream::AsyncTransferOp>(op)) {
+            copySource = transferOp.getSource();
+          } else if (auto cloneOp = dyn_cast<IREE::Stream::AsyncCloneOp>(op)) {
+            copySource = cloneOp.getSource();
+          }
+          if (copySource) {
+            auto sourceType =
+                cast<IREE::Stream::ResourceType>(copySource.getType());
+            auto resultType =
+                cast<IREE::Stream::ResourceType>(result.getType());
+            if (sourceType.getLifetime() == resultType.getLifetime()) {
+              foundPinned = hasPinnedPlacement(copySource, visited);
+            }
+            return foundPinned ? WalkResult::interrupt() : WalkResult::skip();
+          }
+
+          return WalkResult::advance();
+        },
+        TraversalBehavior::DEFAULT);
+    return foundPinned || traversalResult == TraversalResult::INCOMPLETE;
   }
 
   Explorer explorer;
@@ -1034,12 +1100,38 @@ static bool isSafeToElideTransferOp(
     // access, etc).
     // Note that even with unified memory we may need the transfer for other
     // reasons (protective copy, etc) and continue checking below.
-    if (topologyAttr.hasUnifiedMemory(sourceAffinityAttr, resultAffinityAttr) ||
-        topologyAttr.hasTransparentAccess(sourceAffinityAttr,
-                                          resultAffinityAttr)) {
-      LLVM_DEBUG(llvm::dbgs() << "  + topology allows elision (unified memory "
-                                 "or transparent access)\n");
+    //
+    // 3DEV: transparent access is directional (source can access the target's
+    // memory) and may be asymmetric (e.g. GPU/CPU can read NPU memory but not
+    // the reverse). After elision one buffer is shared by both devices:
+    // - if the source storage is pinned (import/constant) it stays on the
+    //   source device and the result device must access it: T(result->source);
+    // - otherwise the shared buffer can later be placed on either device, so
+    //   it is enough that one can access the other's memory.
+    // Unified memory describes a shared memory space and is treated as a
+    // property of the device pair.
+    bool unifiedMemory =
+        topologyAttr.hasUnifiedMemory(sourceAffinityAttr, resultAffinityAttr) ||
+        topologyAttr.hasUnifiedMemory(resultAffinityAttr, sourceAffinityAttr);
+    bool resultAccessesSource = topologyAttr.hasTransparentAccess(
+        resultAffinityAttr, sourceAffinityAttr);
+    bool sourceAccessesResult = topologyAttr.hasTransparentAccess(
+        sourceAffinityAttr, resultAffinityAttr);
+    bool sourcePinned = !unifiedMemory && !resultAccessesSource &&
+                        sourceAccessesResult &&
+                        analysis.hasPinnedPlacement(source);
+    if (unifiedMemory || resultAccessesSource ||
+        (sourceAccessesResult && !sourcePinned)) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "  + topology allows elision (unified="
+                 << unifiedMemory << " result->source=" << resultAccessesSource
+                 << " source->result=" << sourceAccessesResult << ")\n");
       topologyAllowsElision = true;
+    } else if (sourcePinned) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "  - source storage is pinned and result device cannot "
+                    "access it; cannot elide\n");
+      return false;
     } else {
       // Topology requires an actual transfer - cannot elide.
       LLVM_DEBUG(llvm::dbgs()

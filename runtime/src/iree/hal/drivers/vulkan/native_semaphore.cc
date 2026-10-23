@@ -7,7 +7,7 @@
 #include "iree/hal/drivers/vulkan/native_semaphore.h"
 
 #include <cstddef>
-
+#include <cstdio>
 #include "iree/async/semaphore.h"
 #include "iree/base/api.h"
 #include "iree/hal/drivers/vulkan/dynamic_symbol_tables.h"
@@ -30,6 +30,10 @@ extern const iree_hal_semaphore_vtable_t
 
 static iree_hal_vulkan_native_semaphore_t*
 iree_hal_vulkan_native_semaphore_cast(iree_hal_semaphore_t* base_value) {
+  fprintf(stderr, "[DBG] semaphore_cast: value=%p vtable=%p expected=%p\n",
+        (void*)base_value,
+        (void*)((iree_hal_resource_t*)base_value)->vtable,
+        (void*)&iree_hal_vulkan_native_semaphore_vtable);
   IREE_HAL_ASSERT_TYPE(base_value, &iree_hal_vulkan_native_semaphore_vtable);
   return (iree_hal_vulkan_native_semaphore_t*)base_value;
 }

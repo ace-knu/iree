@@ -1,3 +1,4 @@
+#include <stdio.h>
 // Copyright 2019 The IREE Authors
 //
 // Licensed under the Apache License v2.0 with LLVM Exceptions.
@@ -6,8 +7,11 @@
 
 #include "iree/hal/drivers/vulkan/direct_command_buffer.h"
 
+#include <cinttypes>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 #include "iree/base/api.h"
 #include "iree/base/internal/inline_array.h"
@@ -15,9 +19,11 @@
 #include "iree/hal/drivers/vulkan/base_buffer.h"
 #include "iree/hal/drivers/vulkan/descriptor_set_arena.h"
 #include "iree/hal/drivers/vulkan/dynamic_symbols.h"
+#include "iree/hal/drivers/vulkan/native_buffer.h"
 #include "iree/hal/drivers/vulkan/native_event.h"
 #include "iree/hal/drivers/vulkan/native_executable.h"
 #include "iree/hal/drivers/vulkan/pipeline_layout.h"
+#include "iree/hal/drivers/vulkan/sparse_buffer.h"
 #include "iree/hal/drivers/vulkan/status_util.h"
 #include "iree/hal/drivers/vulkan/util/ref_ptr.h"
 #include "iree/hal/utils/resource_set.h"
@@ -66,6 +72,217 @@ iree_hal_vulkan_direct_command_buffer_cast(
   IREE_HAL_ASSERT_TYPE(base_value,
                        &iree_hal_vulkan_direct_command_buffer_vtable);
   return (iree_hal_vulkan_direct_command_buffer_t*)base_value;
+}
+
+// 3DEV: Returns true if |buffer| is backed by a Vulkan buffer and can be passed
+// to iree_hal_vulkan_buffer_handle. Buffers owned by other devices (amdxdna
+// BOs, local heap buffers) are not and must never be cast.
+static bool iree_hal_vulkan_direct_command_buffer_is_vulkan_buffer(
+    iree_hal_buffer_t* buffer) {
+  iree_hal_buffer_t* allocated = iree_hal_buffer_allocated_buffer(buffer);
+  return iree_hal_vulkan_native_buffer_isa(allocated) ||
+         iree_hal_vulkan_sparse_buffer_isa(allocated);
+}
+
+// 3DEV: Builds the error returned when a command receives a buffer it cannot
+// use. |role| names the operand ("source", "binding", ...) and |index| is
+// appended when not -1.
+static iree_status_t iree_hal_vulkan_direct_command_buffer_foreign_buffer_error(
+    const char* op, const char* role, int index, iree_hal_buffer_t* buffer,
+    const char* reason) {
+  iree_hal_buffer_t* allocated = iree_hal_buffer_allocated_buffer(buffer);
+  iree_hal_device_t* device =
+      iree_hal_buffer_allocation_placement(allocated).device;
+  char index_str[16] = {0};
+  if (index >= 0) snprintf(index_str, sizeof(index_str), "[%d]", index);
+  return iree_make_status(
+      IREE_STATUS_FAILED_PRECONDITION,
+      "vulkan %s: %s%s buffer %p (allocated %p) is not a Vulkan buffer and "
+      "cannot be used here (%s); memory_type=0x%x allowed_usage=0x%x "
+      "placement.device=%s%p",
+      op, role, index_str, (void*)buffer, (void*)allocated, reason,
+      (unsigned)iree_hal_buffer_memory_type(allocated),
+      (unsigned)iree_hal_buffer_allowed_usage(allocated),
+      device ? "" : "NULL ", (void*)device);
+}
+
+// 3DEV: Consumes |cause| (a failed BRIDGE export/import) and returns the
+// foreign buffer error for |op| operand |role|/|index| with the cause appended.
+static iree_status_t iree_hal_vulkan_direct_command_buffer_bridge_error(
+    const char* op, const char* role, int index, iree_hal_buffer_t* buffer,
+    const char* stage, iree_status_t cause) {
+  char cause_str[512] = {0};
+  iree_host_size_t cause_length = 0;
+  if (!iree_status_format(cause, sizeof(cause_str), cause_str,
+                          &cause_length)) {
+    snprintf(cause_str, sizeof(cause_str), "%s",
+             iree_status_code_string(iree_status_code(cause)));
+  }
+  iree_status_ignore(cause);
+  char reason[640] = {0};
+  snprintf(reason, sizeof(reason), "BRIDGE %s failed: %s", stage, cause_str);
+  return iree_hal_vulkan_direct_command_buffer_foreign_buffer_error(
+      op, role, index, buffer, reason);
+}
+
+// 3DEV: Returns an error if |buffer| is not a Vulkan buffer. NULL is allowed.
+static iree_status_t iree_hal_vulkan_direct_command_buffer_require_vulkan_buffer(
+    const char* op, const char* role, int index, iree_hal_buffer_t* buffer) {
+  if (!buffer ||
+      iree_hal_vulkan_direct_command_buffer_is_vulkan_buffer(buffer)) {
+    return iree_ok_status();
+  }
+  return iree_hal_vulkan_direct_command_buffer_foreign_buffer_error(
+      op, role, index, buffer,
+      "foreign buffers are not supported by this command");
+}
+
+// BRIDGE (3DEV: shared by dispatch/copy/fill/update): Resolves |ref| to a
+// reference usable by this command buffer. Vulkan buffers (and NULL) are
+// returned unchanged. Buffers owned by another device (e.g. amdxdna BOs,
+// local-task buffers) are not VkBuffers: they are exported by their owner
+// (dma-buf first, then host allocation; host heap buffers without a placement
+// device are mapped for their host pointer) and imported into this device's
+// allocator. The imported buffer aliases the whole allocated buffer so the
+// offset is rebased by the source byte offset. It is retained by the command
+// buffer resource set for the lifetime of the recording. Returns a
+// FAILED_PRECONDITION error naming |op|/|role|/|index| if the buffer cannot be
+// exported or imported.
+static iree_status_t iree_hal_vulkan_direct_command_buffer_resolve_buffer_ref(
+    iree_hal_vulkan_direct_command_buffer_t* command_buffer, const char* op,
+    const char* role, int index, iree_hal_buffer_ref_t ref,
+    iree_hal_buffer_ref_t* out_ref) {
+  *out_ref = ref;
+  iree_hal_buffer_t* src = ref.buffer;
+  if (!src || iree_hal_vulkan_direct_command_buffer_is_vulkan_buffer(src)) {
+    return iree_ok_status();
+  }
+
+  // Log name: "binding[i]" for dispatch (unchanged from the original BRIDGE
+  // logs), "<op> <role>" otherwise.
+  char name[64] = {0};
+  if (strcmp(op, "dispatch") == 0) {
+    snprintf(name, sizeof(name), "%s[%d]", role, index);
+  } else {
+    snprintf(name, sizeof(name), "%s %s", op, role);
+  }
+
+  iree_hal_buffer_t* allocated = iree_hal_buffer_allocated_buffer(src);
+  iree_hal_device_t* src_device =
+      iree_hal_buffer_allocation_placement(allocated).device;
+
+  iree_hal_external_buffer_t ext;
+  memset(&ext, 0, sizeof(ext));
+  iree_status_t s = iree_ok_status();
+  if (!src_device) {
+    // Host (heap) buffers carry no owning device in their placement, so
+    // there is no allocator to ask for an export. Map the buffer to get
+    // its host pointer and import it as HOST_ALLOCATION.
+    // READ|WRITE only: ACCESS_ALL includes DISCARD, and heap buffers in
+    // debug builds scribble 0xCD over the range when mapped for discard
+    // (buffer_heap.c), which wiped the input data before the GPU read it.
+    iree_hal_buffer_mapping_t mapping;
+    s = iree_hal_buffer_map_range(
+        allocated, IREE_HAL_MAPPING_MODE_PERSISTENT,
+        IREE_HAL_MEMORY_ACCESS_READ | IREE_HAL_MEMORY_ACCESS_WRITE, 0,
+        IREE_HAL_WHOLE_BUFFER, &mapping);
+    if (iree_status_is_ok(s)) {
+      ext.type = IREE_HAL_EXTERNAL_BUFFER_TYPE_HOST_ALLOCATION;
+      ext.flags = IREE_HAL_EXTERNAL_BUFFER_FLAG_NONE;
+      ext.size = iree_hal_buffer_allocation_size(allocated);
+      ext.handle.host_allocation.ptr = mapping.contents.data;
+      // Heap unmap is a no-op; the pointer stays valid while the buffer
+      // lives, and the caller keeps the buffer alive for the command.
+      iree_hal_buffer_unmap_range(&mapping);
+    }
+  } else {
+    // Ask the owner for a handle this allocator can import. Try the
+    // cheapest-to-share types in order:
+    //  1. OPAQUE_FD (dma-buf): device allocations such as amdxdna BOs.
+    //  2. HOST_ALLOCATION: host allocations such as local-task buffers;
+    //     imported via VK_EXT_external_memory_host.
+    iree_hal_allocator_t* src_allocator = iree_hal_device_allocator(src_device);
+    s = iree_hal_allocator_export_buffer(
+        src_allocator, allocated, IREE_HAL_EXTERNAL_BUFFER_TYPE_OPAQUE_FD,
+        IREE_HAL_EXTERNAL_BUFFER_FLAG_NONE, &ext);
+    if (!iree_status_is_ok(s)) {
+      iree_status_ignore(s);
+      memset(&ext, 0, sizeof(ext));
+      s = iree_hal_allocator_export_buffer(
+          src_allocator, allocated,
+          IREE_HAL_EXTERNAL_BUFFER_TYPE_HOST_ALLOCATION,
+          IREE_HAL_EXTERNAL_BUFFER_FLAG_NONE, &ext);
+    }
+  }
+  if (!iree_status_is_ok(s)) {
+    fprintf(stderr, "[BR] import %s export failed\n", name);
+    fflush(stderr);
+    return iree_hal_vulkan_direct_command_buffer_bridge_error(
+        op, role, index, src,
+        src_device ? "export from owning allocator"
+                   : "host pointer export (no placement.device)",
+        s);
+  }
+
+  // Imported memory is host-visible (host pointer or HOST_VISIBLE dma-buf),
+  // so allow persistent mapping as well; host-side copies (e.g. tooling
+  // output transfer via block_command_buffer) map with PERSISTENT mode.
+  iree_hal_buffer_params_t params;
+  memset(&params, 0, sizeof(params));
+  params.type = iree_hal_buffer_memory_type(allocated);
+  params.access = IREE_HAL_MEMORY_ACCESS_ALL;
+  params.usage = IREE_HAL_BUFFER_USAGE_DISPATCH_STORAGE |
+                 IREE_HAL_BUFFER_USAGE_TRANSFER |
+                 IREE_HAL_BUFFER_USAGE_MAPPING |
+                 IREE_HAL_BUFFER_USAGE_MAPPING_PERSISTENT;
+  params.queue_affinity = IREE_HAL_QUEUE_AFFINITY_ANY;
+  iree_hal_buffer_t* imported = NULL;
+  s = iree_hal_allocator_import_buffer(
+      command_buffer->device_allocator, params, &ext,
+      iree_hal_buffer_release_callback_null(), &imported);
+  if (!iree_status_is_ok(s)) {
+    fprintf(stderr, "[BR] import %s import failed type=%d", name,
+            (int)ext.type);
+    if (ext.type == IREE_HAL_EXTERNAL_BUFFER_TYPE_HOST_ALLOCATION) {
+      fprintf(stderr, " ptr=%p ptr%%4096=%zu size=%zu size%%4096=%zu",
+              ext.handle.host_allocation.ptr,
+              (size_t)((uintptr_t)ext.handle.host_allocation.ptr % 4096),
+              (size_t)ext.size, (size_t)(ext.size % 4096));
+    }
+    fprintf(stderr, "\n[BR]   reason: ");
+    iree_status_fprint(stderr, s);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+    return iree_hal_vulkan_direct_command_buffer_bridge_error(
+        op, role, index, src, "import into vulkan allocator", s);
+  }
+
+  iree_device_size_t byte_offset = iree_hal_buffer_byte_offset(src);
+  if (ext.type == IREE_HAL_EXTERNAL_BUFFER_TYPE_OPAQUE_FD) {
+    fprintf(stderr, "[BR] import %s ok fd=%d byte_offset=%" PRIu64 "\n", name,
+            ext.handle.opaque_fd.fd, (uint64_t)byte_offset);
+  } else {
+    fprintf(stderr, "[BR] import %s ok host_ptr=%p byte_offset=%" PRIu64 "\n",
+            name, ext.handle.host_allocation.ptr, (uint64_t)byte_offset);
+  }
+  fflush(stderr);
+
+  // The imported buffer has no other owner: always retain it, even for
+  // unretained command buffers (like insert_internal_resources).
+  iree_status_t status = iree_ok_status();
+  if (!command_buffer->resource_set) {
+    status = iree_hal_resource_set_allocate(command_buffer->block_pool,
+                                            &command_buffer->resource_set);
+  }
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_resource_set_insert(command_buffer->resource_set, 1,
+                                          &imported);
+  }
+  iree_hal_buffer_release(imported);
+  IREE_RETURN_IF_ERROR(status);
+  out_ref->buffer = imported;
+  out_ref->offset = byte_offset + ref.offset;
+  return iree_ok_status();
 }
 
 iree_status_t iree_hal_vulkan_direct_command_buffer_allocate(
@@ -363,6 +580,13 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_execution_barrier(
   iree_allocator_t host_allocator =
       command_buffer->logical_device->host_allocator();
 
+  for (iree_host_size_t i = 0; i < buffer_barrier_count; ++i) {
+    IREE_RETURN_IF_ERROR(
+        iree_hal_vulkan_direct_command_buffer_require_vulkan_buffer(
+            "execution_barrier", "buffer_barrier", (int)i,
+            buffer_barriers[i].buffer_ref.buffer));
+  }
+
   iree_inline_array(VkMemoryBarrier, memory_barrier_infos, memory_barrier_count,
                     host_allocator);
   for (int i = 0; i < memory_barrier_count; ++i) {
@@ -455,6 +679,13 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_wait_events(
       iree_hal_vulkan_direct_command_buffer_cast(base_command_buffer);
   iree_allocator_t host_allocator =
       command_buffer->logical_device->host_allocator();
+
+  for (iree_host_size_t i = 0; i < buffer_barrier_count; ++i) {
+    IREE_RETURN_IF_ERROR(
+        iree_hal_vulkan_direct_command_buffer_require_vulkan_buffer(
+            "wait_events", "buffer_barrier", (int)i,
+            buffer_barriers[i].buffer_ref.buffer));
+  }
 
   IREE_RETURN_IF_ERROR(iree_hal_resource_set_insert(
       command_buffer->resource_set, event_count, events));
@@ -550,14 +781,20 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_fill_buffer(
     iree_host_size_t pattern_length, iree_hal_fill_flags_t flags) {
   iree_hal_vulkan_direct_command_buffer_t* command_buffer =
       iree_hal_vulkan_direct_command_buffer_cast(base_command_buffer);
+  // 3DEV: BRIDGE a target owned by another device (see resolve_buffer_ref).
+  iree_hal_buffer_ref_t resolved_target_ref;
+  IREE_RETURN_IF_ERROR(iree_hal_vulkan_direct_command_buffer_resolve_buffer_ref(
+      command_buffer, "fill_buffer", "target", -1, target_ref,
+      &resolved_target_ref));
   VkBuffer target_device_buffer =
-      iree_hal_vulkan_buffer_handle(target_ref.buffer);
+      iree_hal_vulkan_buffer_handle(resolved_target_ref.buffer);
 
   IREE_VULKAN_TRACE_ZONE_BEGIN(command_buffer->tracing_context,
                                command_buffer->handle);
 
   IREE_RETURN_IF_ERROR(iree_hal_resource_set_insert(
       command_buffer->resource_set, 1, &target_ref.buffer));
+  target_ref = resolved_target_ref;
 
   // vkCmdFillBuffer requires a 4 byte alignment for the offset, pattern, and
   // length. We use a polyfill here that fills the unaligned start and end of
@@ -693,8 +930,13 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_update_buffer(
     iree_hal_update_flags_t flags) {
   iree_hal_vulkan_direct_command_buffer_t* command_buffer =
       iree_hal_vulkan_direct_command_buffer_cast(base_command_buffer);
+  // 3DEV: BRIDGE a target owned by another device (see resolve_buffer_ref).
+  iree_hal_buffer_ref_t resolved_target_ref;
+  IREE_RETURN_IF_ERROR(iree_hal_vulkan_direct_command_buffer_resolve_buffer_ref(
+      command_buffer, "update_buffer", "target", -1, target_ref,
+      &resolved_target_ref));
   VkBuffer target_device_buffer =
-      iree_hal_vulkan_buffer_handle(target_ref.buffer);
+      iree_hal_vulkan_buffer_handle(resolved_target_ref.buffer);
 
   IREE_VULKAN_TRACE_ZONE_BEGIN(command_buffer->tracing_context,
                                command_buffer->handle);
@@ -702,6 +944,7 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_update_buffer(
   const iree_hal_buffer_t* target_buffers[1] = {target_ref.buffer};
   IREE_RETURN_IF_ERROR(iree_hal_vulkan_direct_command_buffer_insert_resources(
       command_buffer, 1, target_buffers));
+  target_ref = resolved_target_ref;
 
   // Vulkan only allows updates of <= 65536 because you really, really, really
   // shouldn't do large updates like this (as it wastes command buffer space and
@@ -749,6 +992,17 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_copy_buffer(
     iree_hal_copy_flags_t flags) {
   iree_hal_vulkan_direct_command_buffer_t* command_buffer =
       iree_hal_vulkan_direct_command_buffer_cast(base_command_buffer);
+  // 3DEV: BRIDGE source/target owned by another device (see
+  // resolve_buffer_ref). e.g. tooling output transfer from a local-task buffer
+  // when the lead device is vulkan.
+  iree_hal_buffer_ref_t resolved_source_ref;
+  IREE_RETURN_IF_ERROR(iree_hal_vulkan_direct_command_buffer_resolve_buffer_ref(
+      command_buffer, "copy_buffer", "source", -1, source_ref,
+      &resolved_source_ref));
+  iree_hal_buffer_ref_t resolved_target_ref;
+  IREE_RETURN_IF_ERROR(iree_hal_vulkan_direct_command_buffer_resolve_buffer_ref(
+      command_buffer, "copy_buffer", "target", -1, target_ref,
+      &resolved_target_ref));
 
   IREE_VULKAN_TRACE_ZONE_BEGIN(command_buffer->tracing_context,
                                command_buffer->handle);
@@ -758,7 +1012,7 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_copy_buffer(
       command_buffer, 2, buffers));
 
   iree_hal_vulkan_direct_command_buffer_record_copy_buffer(
-      command_buffer, source_ref, target_ref);
+      command_buffer, resolved_source_ref, resolved_target_ref);
 
   IREE_VULKAN_TRACE_ZONE_END(command_buffer->tracing_context,
                              command_buffer->handle);
@@ -782,15 +1036,94 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_dispatch_bind(
   return iree_ok_status();
 }
 
+// 3DEV debug: the [BR] binding dump below maps each binding to print its first
+// values. A Vulkan map/unmap maps/unmaps the whole VkDeviceMemory
+// (native_buffer.cc), so dumping a buffer that the CPU (local-task) is using
+// through its own mapping invalidates that mapping. Off by default; set
+// IREE_VULKAN_BR_DUMP=1 to map and print the values as before.
+static bool iree_hal_vulkan_br_dump_enabled() {
+  static const bool enabled = [] {
+    const char* value = getenv("IREE_VULKAN_BR_DUMP");
+    return value && strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+iree_hal_buffer_ref_t g_last_bindings[8];
+iree_host_size_t g_last_binding_count = 0;
 static iree_status_t iree_hal_vulkan_direct_command_buffer_dispatch(
     iree_hal_command_buffer_t* base_command_buffer,
     iree_hal_executable_t* executable,
     iree_hal_executable_export_ordinal_t export_ordinal,
     const iree_hal_dispatch_config_t config, iree_const_byte_span_t constants,
     iree_hal_buffer_ref_list_t bindings, iree_hal_dispatch_flags_t flags) {
+  g_last_binding_count = bindings.count < 8 ? bindings.count : 8;
+  for (iree_host_size_t gi = 0; gi < g_last_binding_count; ++gi) g_last_bindings[gi] = bindings.values[gi];
+  fprintf(stderr, "[BR] vk dispatch entry=%u wg=[%u %u %u] bindings=%zu\n", (unsigned)export_ordinal,
+          (unsigned)config.workgroup_count[0], (unsigned)config.workgroup_count[1],
+          (unsigned)config.workgroup_count[2], (size_t)bindings.count);
+  for (iree_host_size_t bi = 0; bi < bindings.count; ++bi) {
+    iree_hal_buffer_ref_t ref = bindings.values[bi];
+    if (!iree_hal_vulkan_br_dump_enabled()) {
+      // No mapping: print what the ref carries.
+      fprintf(stderr,
+              "[BR] vk dispatch binding[%zu] buf=%p dev=%p type=0x%x "
+              "offset=%" PRIu64 " length=%" PRIu64 "\n",
+              (size_t)bi, (void*)ref.buffer,
+              (void*)iree_hal_buffer_allocation_placement(ref.buffer).device,
+              (unsigned)iree_hal_buffer_memory_type(ref.buffer),
+              (uint64_t)ref.offset, (uint64_t)ref.length);
+      fflush(stderr);
+      continue;
+    }
+    iree_hal_buffer_mapping_t m;
+    iree_status_t ms = iree_hal_buffer_map_range(ref.buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+        IREE_HAL_MEMORY_ACCESS_READ, ref.offset, 16, &m);
+    if (iree_status_is_ok(ms)) {
+      const float* f = (const float*)m.contents.data;
+      fprintf(stderr, "[BR] vk dispatch binding[%zu] buf=%p dev=%p type=0x%x first=[%g %g %g %g]\n",
+              (size_t)bi, (void*)ref.buffer, (void*)iree_hal_buffer_allocation_placement(ref.buffer).device,
+              (unsigned)iree_hal_buffer_memory_type(ref.buffer), f[0], f[1], f[2], f[3]);
+      iree_hal_buffer_unmap_range(&m);
+    } else {
+      fprintf(stderr, "[BR] vk dispatch binding[%zu] buf=%p type=0x%x unmappable\n",
+              (size_t)bi, (void*)ref.buffer, (unsigned)iree_hal_buffer_memory_type(ref.buffer));
+      iree_status_ignore(ms);
+    }
+    fflush(stderr);
+  }
   iree_hal_vulkan_direct_command_buffer_t* command_buffer =
       iree_hal_vulkan_direct_command_buffer_cast(base_command_buffer);
 
+  // BRIDGE: bindings owned by another device (e.g. amdxdna BOs) are not
+  // VkBuffers. Export them as dma-buf fds and import as VkDeviceMemory so the
+  // dispatch can bind them directly. Without this the buffer_handle cast in
+  // descriptor_set_arena reads garbage and the shader silently sees zeros.
+  // 3DEV: the export/import lives in resolve_buffer_ref (shared with
+  // copy/fill/update).
+  iree_hal_buffer_ref_t patched_bindings[8];
+  if (bindings.count <= 8) {
+    for (iree_host_size_t bi = 0; bi < bindings.count; ++bi) {
+      IREE_RETURN_IF_ERROR(
+          iree_hal_vulkan_direct_command_buffer_resolve_buffer_ref(
+              command_buffer, "dispatch", "binding", (int)bi,
+              bindings.values[bi], &patched_bindings[bi]));
+    }
+    bindings.values = patched_bindings;
+  }
+  // 3DEV: every binding must now be a Vulkan buffer (this also covers the
+  // >8 bindings case where the BRIDGE above does not run).
+  for (iree_host_size_t bi = 0; bi < bindings.count; ++bi) {
+    IREE_RETURN_IF_ERROR(
+        iree_hal_vulkan_direct_command_buffer_require_vulkan_buffer(
+            "dispatch", "binding", (int)bi, bindings.values[bi].buffer));
+  }
+  if (iree_hal_dispatch_uses_indirect_parameters(flags)) {
+    IREE_RETURN_IF_ERROR(
+        iree_hal_vulkan_direct_command_buffer_require_vulkan_buffer(
+            "dispatch", "workgroup_count", -1,
+            config.workgroup_count_ref.buffer));
+  }
   // TODO: we can support CUSTOM_DIRECT_ARGUMENTS pretty easily. Indirect
   // arguments may require a uniform buffer and shader changes.
   if (iree_hal_dispatch_uses_custom_arguments(flags)) {

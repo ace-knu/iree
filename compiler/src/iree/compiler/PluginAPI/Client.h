@@ -88,6 +88,12 @@ public:
   // (e.g. per-dispatch device placement) which is not possible from the
   // earlier input-conversion/preprocessing hooks.
   virtual void extendFlowTransformPassPipeline(OpPassManager &passManager) {}
+
+  // Adds passes to the |buildStreamTransformPassPipeline| pipeline at the end,
+  // i.e. after ScheduleAllocation has produced allocation affinities (e.g.
+  // #hal.device.optimal<[...]>) but before the HAL phase. Lets a plugin resolve
+  // buffer ownership at compile time from the stream.topology table.
+  virtual void extendStreamTransformPassPipeline(OpPassManager &passManager) {}
 };
 
 // Policy for how to activate the plugin.
