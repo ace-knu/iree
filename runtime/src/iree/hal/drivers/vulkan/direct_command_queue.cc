@@ -5,8 +5,6 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/hal/drivers/vulkan/direct_command_queue.h"
-extern iree_hal_buffer_ref_t g_last_bindings[8];
-extern iree_host_size_t g_last_binding_count;
 
 #include <cstdio>
 

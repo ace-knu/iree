@@ -1049,16 +1049,12 @@ static bool iree_hal_vulkan_br_dump_enabled() {
   return enabled;
 }
 
-iree_hal_buffer_ref_t g_last_bindings[8];
-iree_host_size_t g_last_binding_count = 0;
 static iree_status_t iree_hal_vulkan_direct_command_buffer_dispatch(
     iree_hal_command_buffer_t* base_command_buffer,
     iree_hal_executable_t* executable,
     iree_hal_executable_export_ordinal_t export_ordinal,
     const iree_hal_dispatch_config_t config, iree_const_byte_span_t constants,
     iree_hal_buffer_ref_list_t bindings, iree_hal_dispatch_flags_t flags) {
-  g_last_binding_count = bindings.count < 8 ? bindings.count : 8;
-  for (iree_host_size_t gi = 0; gi < g_last_binding_count; ++gi) g_last_bindings[gi] = bindings.values[gi];
   fprintf(stderr, "[BR] vk dispatch entry=%u wg=[%u %u %u] bindings=%zu\n", (unsigned)export_ordinal,
           (unsigned)config.workgroup_count[0], (unsigned)config.workgroup_count[1],
           (unsigned)config.workgroup_count[2], (size_t)bindings.count);

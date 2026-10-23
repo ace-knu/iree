@@ -1,4 +1,3 @@
-#include <execinfo.h>
 #include <stdio.h>
 // Copyright 2023 The IREE Authors
 //
