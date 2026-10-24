@@ -1364,7 +1364,7 @@ static LogicalResult setReductionConfig(IREE::GPU::TargetAttr target,
     if (failed(setOpConfigAndEntryPointFnTranslation(
             op->getParentOfType<mlir::FunctionOpInterface>(), op, config,
             getSPIRVTranslationInfo(ctx, SPIRVPipeline::SubgroupReduce,
-                                    workgroupSize)))) {
+                                    workgroupSize, subgroupSize)))) {
       return failure();
     }
 
@@ -1490,7 +1490,7 @@ static LogicalResult setReductionConfig(IREE::GPU::TargetAttr target,
   if (failed(setOpConfigAndEntryPointFnTranslation(
           op->getParentOfType<mlir::FunctionOpInterface>(), op, config,
           getSPIRVTranslationInfo(ctx, SPIRVPipeline::SubgroupReduce,
-                                  workgroupSize)))) {
+                                  workgroupSize, subgroupSize)))) {
     return failure();
   }
 
