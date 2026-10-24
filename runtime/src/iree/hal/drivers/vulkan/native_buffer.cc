@@ -141,8 +141,10 @@ static iree_status_t iree_hal_vulkan_native_buffer_map_range(
           : IREE_HAL_BUFFER_USAGE_MAPPING_SCOPED));
 
   // Map VK_WHOLE_SIZE once and hand out sub-ranges of it (see
-  // mapping_mutex). The buffer is bound at memoryOffset 0, so
-  // local_byte_offset is also the offset into device_memory.
+  // mapping_mutex). Dense allocations and device-memory imports are bound at
+  // memoryOffset 0, so local_byte_offset is also the offset into
+  // device_memory. (Host-pointer imports bind at an alignment offset; they are
+  // only used inside the bridge and are not mapped here.)
   iree_slim_mutex_lock(&buffer->mapping_mutex);
   iree_status_t status = iree_ok_status();
   if (!buffer->mapped_ptr) {
