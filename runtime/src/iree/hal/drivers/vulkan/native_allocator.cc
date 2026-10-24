@@ -303,9 +303,15 @@ static iree_status_t iree_hal_vulkan_native_allocator_commit_and_wrap(
     if (props & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
       actual_type |= IREE_HAL_MEMORY_TYPE_HOST_CACHED;
 
+    // Both mapping modes: CPU dispatches map their bindings scoped, while
+    // tooling transfers and the shared buffer bridge map persistently. A
+    // GPU-owned buffer that the CPU also uses may have been allocated without
+    // any mapping usage (the owner is resolved at compile time, so no shared
+    // usage bits are requested).
     if ((props & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
         (props & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-      actual_usage |= IREE_HAL_BUFFER_USAGE_MAPPING_PERSISTENT;
+      actual_usage |= IREE_HAL_BUFFER_USAGE_MAPPING |
+                      IREE_HAL_BUFFER_USAGE_MAPPING_PERSISTENT;
     }
   }
 
