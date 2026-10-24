@@ -1020,6 +1020,12 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_dispatch(
   // copy/fill/update).
   iree_hal_buffer_ref_t patched_bindings[8];
   if (bindings.count <= 8) {
+    // Retain the original buffers too: an imported host allocation only
+    // aliases the source memory and does not keep the source buffer alive.
+    IREE_RETURN_IF_ERROR(iree_hal_resource_set_insert_strided(
+        command_buffer->resource_set, bindings.count, bindings.values,
+        offsetof(iree_hal_buffer_ref_t, buffer),
+        sizeof(iree_hal_buffer_ref_t)));
     for (iree_host_size_t bi = 0; bi < bindings.count; ++bi) {
       IREE_RETURN_IF_ERROR(
           iree_hal_vulkan_direct_command_buffer_resolve_buffer_ref(
