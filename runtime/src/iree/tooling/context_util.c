@@ -10,7 +10,6 @@ iree_hal_device_group_t* iree_tooling_experimental_device_group = NULL;
 
 #include <memory.h>
 #include <string.h>
-#include <stdio.h>
 
 #include "iree/async/frontier_tracker.h"
 #include "iree/async/util/proactor_pool.h"
@@ -188,8 +187,6 @@ static iree_status_t iree_hal_module_device_allocator_select_specific(
     iree_hal_memory_type_t memory_types, iree_hal_buffer_usage_t buffer_usage,
     iree_hal_module_device_allocator_select_flags_t flags,
     iree_host_size_t* out_selection) {
-    
-  
   for (iree_host_size_t i = 0; i < device_count; ++i) {
     if (devices[i].device == user_data) {
       *out_selection = i;

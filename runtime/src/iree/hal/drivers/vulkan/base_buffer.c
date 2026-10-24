@@ -310,13 +310,6 @@ iree_status_t iree_hal_vulkan_populate_memory_types(
     return iree_make_status(IREE_STATUS_INTERNAL,
                             "transfer-compatible memory types not found");
   }
-  fprintf(stderr,                                    // ← 여기
-          "[DBG] memtypes dispatch=%d bulk_up=%d bulk_dn=%d stg_up=%d stg_dn=%d\n",
-          out_memory_types->dispatch_idx, out_memory_types->bulk_upload_idx,
-          out_memory_types->bulk_download_idx,
-          out_memory_types->staging_upload_idx,
-          out_memory_types->staging_download_idx);
-
   return iree_ok_status();
 }
 

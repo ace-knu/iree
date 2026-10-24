@@ -1,4 +1,3 @@
-#include <stdio.h>
 // Copyright 2023 The IREE Authors
 //
 // Licensed under the Apache License v2.0 with LLVM Exceptions.
@@ -308,10 +307,6 @@ static iree_status_t iree_hal_vulkan_native_allocator_commit_and_wrap(
         (props & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
       actual_usage |= IREE_HAL_BUFFER_USAGE_MAPPING_PERSISTENT;
     }
-
-    fprintf(stderr, "[BR] vulkan alloc idx=%u vkprops=0x%x -> hal_type=0x%x usage=0x%x\n",
-            memory_type_index, (unsigned)props, (unsigned)actual_type,
-            (unsigned)actual_usage);
   }
 
   if (use_sparse_allocation) {

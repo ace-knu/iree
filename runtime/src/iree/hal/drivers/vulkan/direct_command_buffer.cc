@@ -1,4 +1,3 @@
-#include <stdio.h>
 // Copyright 2019 The IREE Authors
 //
 // Licensed under the Apache License v2.0 with LLVM Exceptions.
@@ -7,10 +6,9 @@
 
 #include "iree/hal/drivers/vulkan/direct_command_buffer.h"
 
-#include <cinttypes>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
+#include <cstdio>
 #include <cstring>
 
 #include "iree/base/api.h"
@@ -158,15 +156,6 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_resolve_buffer_ref(
     return iree_ok_status();
   }
 
-  // Log name: "binding[i]" for dispatch (unchanged from the original BRIDGE
-  // logs), "<op> <role>" otherwise.
-  char name[64] = {0};
-  if (strcmp(op, "dispatch") == 0) {
-    snprintf(name, sizeof(name), "%s[%d]", role, index);
-  } else {
-    snprintf(name, sizeof(name), "%s %s", op, role);
-  }
-
   iree_hal_buffer_t* allocated = iree_hal_buffer_allocated_buffer(src);
   iree_hal_device_t* src_device =
       iree_hal_buffer_allocation_placement(allocated).device;
@@ -215,8 +204,6 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_resolve_buffer_ref(
     }
   }
   if (!iree_status_is_ok(s)) {
-    fprintf(stderr, "[BR] import %s export failed\n", name);
-    fflush(stderr);
     return iree_hal_vulkan_direct_command_buffer_bridge_error(
         op, role, index, src,
         src_device ? "export from owning allocator"
@@ -241,31 +228,11 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_resolve_buffer_ref(
       command_buffer->device_allocator, params, &ext,
       iree_hal_buffer_release_callback_null(), &imported);
   if (!iree_status_is_ok(s)) {
-    fprintf(stderr, "[BR] import %s import failed type=%d", name,
-            (int)ext.type);
-    if (ext.type == IREE_HAL_EXTERNAL_BUFFER_TYPE_HOST_ALLOCATION) {
-      fprintf(stderr, " ptr=%p ptr%%4096=%zu size=%zu size%%4096=%zu",
-              ext.handle.host_allocation.ptr,
-              (size_t)((uintptr_t)ext.handle.host_allocation.ptr % 4096),
-              (size_t)ext.size, (size_t)(ext.size % 4096));
-    }
-    fprintf(stderr, "\n[BR]   reason: ");
-    iree_status_fprint(stderr, s);
-    fprintf(stderr, "\n");
-    fflush(stderr);
     return iree_hal_vulkan_direct_command_buffer_bridge_error(
         op, role, index, src, "import into vulkan allocator", s);
   }
 
   iree_device_size_t byte_offset = iree_hal_buffer_byte_offset(src);
-  if (ext.type == IREE_HAL_EXTERNAL_BUFFER_TYPE_OPAQUE_FD) {
-    fprintf(stderr, "[BR] import %s ok fd=%d byte_offset=%" PRIu64 "\n", name,
-            ext.handle.opaque_fd.fd, (uint64_t)byte_offset);
-  } else {
-    fprintf(stderr, "[BR] import %s ok host_ptr=%p byte_offset=%" PRIu64 "\n",
-            name, ext.handle.host_allocation.ptr, (uint64_t)byte_offset);
-  }
-  fflush(stderr);
 
   // The imported buffer has no other owner: always retain it, even for
   // unretained command buffers (like insert_internal_resources).
@@ -1036,58 +1003,12 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_dispatch_bind(
   return iree_ok_status();
 }
 
-// 3DEV debug: the [BR] binding dump below maps each binding to print its first
-// values. A Vulkan map/unmap maps/unmaps the whole VkDeviceMemory
-// (native_buffer.cc), so dumping a buffer that the CPU (local-task) is using
-// through its own mapping invalidates that mapping. Off by default; set
-// IREE_VULKAN_BR_DUMP=1 to map and print the values as before.
-static bool iree_hal_vulkan_br_dump_enabled() {
-  static const bool enabled = [] {
-    const char* value = getenv("IREE_VULKAN_BR_DUMP");
-    return value && strcmp(value, "1") == 0;
-  }();
-  return enabled;
-}
-
 static iree_status_t iree_hal_vulkan_direct_command_buffer_dispatch(
     iree_hal_command_buffer_t* base_command_buffer,
     iree_hal_executable_t* executable,
     iree_hal_executable_export_ordinal_t export_ordinal,
     const iree_hal_dispatch_config_t config, iree_const_byte_span_t constants,
     iree_hal_buffer_ref_list_t bindings, iree_hal_dispatch_flags_t flags) {
-  fprintf(stderr, "[BR] vk dispatch entry=%u wg=[%u %u %u] bindings=%zu\n", (unsigned)export_ordinal,
-          (unsigned)config.workgroup_count[0], (unsigned)config.workgroup_count[1],
-          (unsigned)config.workgroup_count[2], (size_t)bindings.count);
-  for (iree_host_size_t bi = 0; bi < bindings.count; ++bi) {
-    iree_hal_buffer_ref_t ref = bindings.values[bi];
-    if (!iree_hal_vulkan_br_dump_enabled()) {
-      // No mapping: print what the ref carries.
-      fprintf(stderr,
-              "[BR] vk dispatch binding[%zu] buf=%p dev=%p type=0x%x "
-              "offset=%" PRIu64 " length=%" PRIu64 "\n",
-              (size_t)bi, (void*)ref.buffer,
-              (void*)iree_hal_buffer_allocation_placement(ref.buffer).device,
-              (unsigned)iree_hal_buffer_memory_type(ref.buffer),
-              (uint64_t)ref.offset, (uint64_t)ref.length);
-      fflush(stderr);
-      continue;
-    }
-    iree_hal_buffer_mapping_t m;
-    iree_status_t ms = iree_hal_buffer_map_range(ref.buffer, IREE_HAL_MAPPING_MODE_SCOPED,
-        IREE_HAL_MEMORY_ACCESS_READ, ref.offset, 16, &m);
-    if (iree_status_is_ok(ms)) {
-      const float* f = (const float*)m.contents.data;
-      fprintf(stderr, "[BR] vk dispatch binding[%zu] buf=%p dev=%p type=0x%x first=[%g %g %g %g]\n",
-              (size_t)bi, (void*)ref.buffer, (void*)iree_hal_buffer_allocation_placement(ref.buffer).device,
-              (unsigned)iree_hal_buffer_memory_type(ref.buffer), f[0], f[1], f[2], f[3]);
-      iree_hal_buffer_unmap_range(&m);
-    } else {
-      fprintf(stderr, "[BR] vk dispatch binding[%zu] buf=%p type=0x%x unmappable\n",
-              (size_t)bi, (void*)ref.buffer, (unsigned)iree_hal_buffer_memory_type(ref.buffer));
-      iree_status_ignore(ms);
-    }
-    fflush(stderr);
-  }
   iree_hal_vulkan_direct_command_buffer_t* command_buffer =
       iree_hal_vulkan_direct_command_buffer_cast(base_command_buffer);
 

@@ -6,9 +6,6 @@
 
 #include "iree/hal/drivers/vulkan/vulkan_device.h"
 
-#include <stdio.h>
-
-
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -230,7 +227,7 @@ IREE_API_EXPORT iree_status_t iree_hal_vulkan_query_extensibility_set(
   // Optional to enable import/export of host pointers.
   ADD_EXT(IREE_HAL_VULKAN_EXTENSIBILITY_DEVICE_EXTENSIONS_OPTIONAL,
           VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
-  
+
   // VK_KHR_external_memory_fd:
   // Optional to enable import/export of POSIX file descriptors, used for
   // dma-buf sharing with other devices (NPU BOs exported via PRIME).
@@ -240,8 +237,6 @@ IREE_API_EXPORT iree_status_t iree_hal_vulkan_query_extensibility_set(
   // Optional; allows the imported fd to be a Linux dma-buf.
   ADD_EXT(IREE_HAL_VULKAN_EXTENSIBILITY_DEVICE_EXTENSIONS_OPTIONAL,
           VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
-
-
 
   // VK_KHR_buffer_device_address:
   // Promoted to core in Vulkan 1.2 but still an extension in 1.1.
@@ -1061,9 +1056,6 @@ static iree_status_t iree_hal_vulkan_query_device_properties(
   if (physical_device_features.features.shaderInt16) {
     out_properties->compute_int |= 0x2u;
   }
-
-
-
   if (physical_device_features.features.shaderInt64) {
     out_properties->compute_int |= 0x4u;
   }
@@ -1164,12 +1156,6 @@ iree_status_t iree_hal_vulkan_device_create(
       &optional_extensions, &arena, &enabled_extensions));
   iree_hal_vulkan_device_extensions_t enabled_device_extensions =
       iree_hal_vulkan_populate_enabled_device_extensions(&enabled_extensions);
-  
-  fprintf(stderr, "[DBG] vk ext: memory_fd=%d dma_buf=%d host=%d\n",
-          enabled_device_extensions.external_memory_fd,
-          enabled_device_extensions.external_memory_dma_buf,
-          enabled_device_extensions.external_memory_host);
-  fflush(stderr);
 
   // Find queue families we will expose as HAL queues.
   iree_hal_vulkan_queue_family_info_t queue_family_info;

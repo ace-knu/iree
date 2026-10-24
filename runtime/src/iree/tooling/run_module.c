@@ -361,9 +361,6 @@ static iree_status_t iree_tooling_run_function(
         }
         if (!iree_status_is_ok(status)) break;
         if (lead_listed) {
-          fprintf(stderr, "[BR] input[%zu] -> lead (reflection '%.*s')\n", i,
-                  (int)entry.size, entry.data);
-          fflush(stderr);
           continue;
         }
         idx = first_idx;
@@ -411,10 +408,6 @@ static iree_status_t iree_tooling_run_function(
         status = iree_vm_list_set_ref_move(inputs, i, &ref);
       }
       iree_hal_buffer_release(dst);
-      fprintf(stderr, "[BR] input[%zu] -> device %zu (%s, %s)\n", i, idx,
-              iree_status_is_ok(status) ? "ok" : "FAILED",
-              input_device_from_flag ? "flag" : "reflection");
-      fflush(stderr);
     }
   }
 

@@ -6,8 +6,6 @@
 
 #include "iree/hal/drivers/vulkan/direct_command_queue.h"
 
-#include <cstdio>
-
 #include <cstdint>
 
 #include "iree/hal/drivers/vulkan/direct_command_buffer.h"
@@ -51,7 +49,6 @@ iree_status_t DirectCommandQueue::TranslateBatchInfo(
     if (!iree_hal_vulkan_native_semaphore_isa(semaphore)) {
       // BRIDGE(L1): semaphore owned by another device; timeline import is not
       // implemented so block on the host until it reaches the value.
-      fprintf(stderr, "[BR] vulkan wait-foreign sem=%p value=%llu\n", (void*)semaphore, (unsigned long long)value); fflush(stderr);
       IREE_RETURN_IF_ERROR(
           iree_hal_semaphore_wait(semaphore, value, iree_infinite_timeout(),
                                   IREE_ASYNC_WAIT_FLAG_NONE));
@@ -75,7 +72,6 @@ iree_status_t DirectCommandQueue::TranslateBatchInfo(
     if (!iree_hal_vulkan_native_semaphore_isa(semaphore)) {
       // BRIDGE(L1): signaled from the host after the submission completes.
       has_foreign_signal = true;
-      fprintf(stderr, "[BR] vulkan signal-foreign sem=%p\n", (void*)semaphore); fflush(stderr);
       continue;
     }
     signal_semaphore_handles[signal_count] =
@@ -160,13 +156,6 @@ iree_status_t DirectCommandQueue::Submit(
                             submit_infos.data(), fence),
       "vkQueueSubmit");
   iree_slim_mutex_unlock(&queue_mutex_);
-  for (iree_host_size_t b = 0; b < batch_count; ++b) {
-    fprintf(stderr, "[BR] vk submit cmdbufs=%zu waits=%zu signals=%zu ok=%d t=%.3fms\n",
-            (size_t)batches[b].command_buffer_count, (size_t)batches[b].wait_semaphores.count,
-            (size_t)batches[b].signal_semaphores.count, (int)iree_status_is_ok(status),
-            iree_time_now() / 1e6);
-  }
-  fflush(stderr);
   if (fence != VK_NULL_HANDLE) {
     if (iree_status_is_ok(status)) {
       status = VK_RESULT_TO_STATUS(
