@@ -72,7 +72,7 @@ iree_hal_vulkan_direct_command_buffer_cast(
   return (iree_hal_vulkan_direct_command_buffer_t*)base_value;
 }
 
-// 3DEV: Returns true if |buffer| is backed by a Vulkan buffer and can be passed
+// Returns true if |buffer| is backed by a Vulkan buffer and can be passed
 // to iree_hal_vulkan_buffer_handle. Buffers owned by other devices (amdxdna
 // BOs, local heap buffers) are not and must never be cast.
 static bool iree_hal_vulkan_direct_command_buffer_is_vulkan_buffer(
@@ -82,7 +82,7 @@ static bool iree_hal_vulkan_direct_command_buffer_is_vulkan_buffer(
          iree_hal_vulkan_sparse_buffer_isa(allocated);
 }
 
-// 3DEV: Builds the error returned when a command receives a buffer it cannot
+// Builds the error returned when a command receives a buffer it cannot
 // use. |role| names the operand ("source", "binding", ...) and |index| is
 // appended when not -1.
 static iree_status_t iree_hal_vulkan_direct_command_buffer_foreign_buffer_error(
@@ -104,7 +104,7 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_foreign_buffer_error(
       device ? "" : "NULL ", (void*)device);
 }
 
-// 3DEV: Consumes |cause| (a failed BRIDGE export/import) and returns the
+// Consumes |cause| (a failed BRIDGE export/import) and returns the
 // foreign buffer error for |op| operand |role|/|index| with the cause appended.
 static iree_status_t iree_hal_vulkan_direct_command_buffer_bridge_error(
     const char* op, const char* role, int index, iree_hal_buffer_t* buffer,
@@ -123,7 +123,7 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_bridge_error(
       op, role, index, buffer, reason);
 }
 
-// 3DEV: Returns an error if |buffer| is not a Vulkan buffer. NULL is allowed.
+// Returns an error if |buffer| is not a Vulkan buffer. NULL is allowed.
 static iree_status_t iree_hal_vulkan_direct_command_buffer_require_vulkan_buffer(
     const char* op, const char* role, int index, iree_hal_buffer_t* buffer) {
   if (!buffer ||
@@ -135,7 +135,7 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_require_vulkan_buffer
       "foreign buffers are not supported by this command");
 }
 
-// BRIDGE (3DEV: shared by dispatch/copy/fill/update): Resolves |ref| to a
+// BRIDGE (shared by dispatch/copy/fill/update): Resolves |ref| to a
 // reference usable by this command buffer. Vulkan buffers (and NULL) are
 // returned unchanged. Buffers owned by another device (e.g. amdxdna BOs,
 // local-task buffers) are not VkBuffers: they are exported by their owner
@@ -748,7 +748,7 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_fill_buffer(
     iree_host_size_t pattern_length, iree_hal_fill_flags_t flags) {
   iree_hal_vulkan_direct_command_buffer_t* command_buffer =
       iree_hal_vulkan_direct_command_buffer_cast(base_command_buffer);
-  // 3DEV: BRIDGE a target owned by another device (see resolve_buffer_ref).
+  // BRIDGE a target owned by another device (see resolve_buffer_ref).
   iree_hal_buffer_ref_t resolved_target_ref;
   IREE_RETURN_IF_ERROR(iree_hal_vulkan_direct_command_buffer_resolve_buffer_ref(
       command_buffer, "fill_buffer", "target", -1, target_ref,
@@ -897,7 +897,7 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_update_buffer(
     iree_hal_update_flags_t flags) {
   iree_hal_vulkan_direct_command_buffer_t* command_buffer =
       iree_hal_vulkan_direct_command_buffer_cast(base_command_buffer);
-  // 3DEV: BRIDGE a target owned by another device (see resolve_buffer_ref).
+  // BRIDGE a target owned by another device (see resolve_buffer_ref).
   iree_hal_buffer_ref_t resolved_target_ref;
   IREE_RETURN_IF_ERROR(iree_hal_vulkan_direct_command_buffer_resolve_buffer_ref(
       command_buffer, "update_buffer", "target", -1, target_ref,
@@ -959,7 +959,7 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_copy_buffer(
     iree_hal_copy_flags_t flags) {
   iree_hal_vulkan_direct_command_buffer_t* command_buffer =
       iree_hal_vulkan_direct_command_buffer_cast(base_command_buffer);
-  // 3DEV: BRIDGE source/target owned by another device (see
+  // BRIDGE source/target owned by another device (see
   // resolve_buffer_ref). e.g. tooling output transfer from a local-task buffer
   // when the lead device is vulkan.
   iree_hal_buffer_ref_t resolved_source_ref;
@@ -1016,7 +1016,7 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_dispatch(
   // VkBuffers. Export them as dma-buf fds and import as VkDeviceMemory so the
   // dispatch can bind them directly. Without this the buffer_handle cast in
   // descriptor_set_arena reads garbage and the shader silently sees zeros.
-  // 3DEV: the export/import lives in resolve_buffer_ref (shared with
+  // The export/import lives in resolve_buffer_ref (shared with
   // copy/fill/update).
   iree_hal_buffer_ref_t patched_bindings[8];
   if (bindings.count <= 8) {
@@ -1034,7 +1034,7 @@ static iree_status_t iree_hal_vulkan_direct_command_buffer_dispatch(
     }
     bindings.values = patched_bindings;
   }
-  // 3DEV: every binding must now be a Vulkan buffer (this also covers the
+  // Every binding must now be a Vulkan buffer (this also covers the
   // >8 bindings case where the BRIDGE above does not run).
   for (iree_host_size_t bi = 0; bi < bindings.count; ++bi) {
     IREE_RETURN_IF_ERROR(

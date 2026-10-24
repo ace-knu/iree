@@ -20,7 +20,7 @@ typedef struct iree_hal_vulkan_native_buffer_t {
   iree::hal::vulkan::VkDeviceHandle* logical_device;
   iree_hal_vulkan_native_buffer_release_callback_t internal_release_callback;
   iree_hal_buffer_release_callback_t user_release_callback;
-  // 3DEV: host mapping of the whole device_memory, created by the first
+  // Host mapping of the whole device_memory, created by the first
   // map_range and kept until the buffer is destroyed. vkMapMemory may not be
   // called on memory that is already mapped and vkUnmapMemory unmaps the whole
   // object, so concurrent users of one buffer (e.g. CPU dispatches on
@@ -93,7 +93,7 @@ static void iree_hal_vulkan_native_buffer_destroy(
   IREE_TRACE_ZONE_APPEND_VALUE_I64(
       z0, (int64_t)iree_hal_buffer_allocation_size(base_buffer));
 
-  // 3DEV: drop the persistent mapping before the memory is released.
+  // Drop the persistent mapping before the memory is released.
   if (buffer->mapped_ptr) {
     buffer->logical_device->syms()->vkUnmapMemory(*buffer->logical_device,
                                                   buffer->base.device_memory);
@@ -140,7 +140,7 @@ static iree_status_t iree_hal_vulkan_native_buffer_map_range(
           ? IREE_HAL_BUFFER_USAGE_MAPPING_PERSISTENT
           : IREE_HAL_BUFFER_USAGE_MAPPING_SCOPED));
 
-  // 3DEV: map VK_WHOLE_SIZE once and hand out sub-ranges of it (see
+  // Map VK_WHOLE_SIZE once and hand out sub-ranges of it (see
   // mapping_mutex). The buffer is bound at memoryOffset 0, so
   // local_byte_offset is also the offset into device_memory.
   iree_slim_mutex_lock(&buffer->mapping_mutex);
@@ -160,7 +160,7 @@ static iree_status_t iree_hal_vulkan_native_buffer_map_range(
   uint8_t* data_ptr = base_ptr + local_byte_offset;
   mapping->contents = iree_make_byte_span(data_ptr, local_byte_length);
 
-  // 3DEV: a fresh vkMapMemory never made device writes visible either, so for
+  // A fresh vkMapMemory never made device writes visible either, so for
   // non-coherent memory read access invalidates here (whole object, which
   // always satisfies nonCoherentAtomSize). No-op for HOST_COHERENT memory.
   if (!iree_all_bits_set(iree_hal_buffer_memory_type(base_buffer),
@@ -200,7 +200,7 @@ static iree_status_t iree_hal_vulkan_native_buffer_unmap_range(
         IREE_STATUS_FAILED_PRECONDITION,
         "buffer does not have device memory attached and cannot be mapped");
   }
-  // 3DEV: the mapping is persistent (see mapping_mutex); other users of the
+  // The mapping is persistent (see mapping_mutex); other users of the
   // same memory may still hold pointers into it, so nothing is unmapped here.
   // For non-coherent memory written through this mapping, flush so the device
   // sees the data (whole object; no-op for HOST_COHERENT memory).

@@ -269,9 +269,10 @@ util.func public @elide_asymmetric_transient_result_accesses_source(%value: i32)
 
 // -----
 
-// Asymmetric transparent access in the other direction: the transient source
-// can be read by the result device's owner choice (a->b accessible), so the
-// transfer is elided as before.
+// Asymmetric transparent access in the other direction: @dev_a can access
+// @dev_b memory but not the reverse. A transient produced on @dev_a can be
+// placed in @dev_b memory and written there by @dev_a, so the transfer is
+// elided as before (the original (a->b) rule).
 
 module @test attributes {
   stream.topology = #hal.device.topology<links = [

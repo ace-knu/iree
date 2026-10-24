@@ -723,7 +723,7 @@ public:
     return containsBorrowedStorage(value, visited);
   }
 
-  // 3DEV: Returns true if the storage backing |value| has a placement this pass
+  // Returns true if the storage backing |value| has a placement this pass
   // cannot change: it aliases an imported (caller-allocated) buffer or a
   // constant/global resource allocated by an initializer. Eliding a transfer of
   // such a value binds that storage directly on the result device. Values whose
@@ -1101,7 +1101,7 @@ static bool isSafeToElideTransferOp(
     // Note that even with unified memory we may need the transfer for other
     // reasons (protective copy, etc) and continue checking below.
     //
-    // 3DEV: transparent access is directional (source can access the target's
+    // Transparent access is directional (source can access the target's
     // memory) and may be asymmetric (e.g. GPU/CPU can read NPU memory but not
     // the reverse). After elision one buffer is shared by both devices:
     // - if the source storage is pinned (import/constant) it stays on the

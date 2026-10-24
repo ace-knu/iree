@@ -614,12 +614,11 @@ static VkDeviceSize iree_hal_vulkan_native_allocator_align_external_ptr(
       (iree_device_size_t)requirements->alignment,
       (iree_device_size_t)allocator->min_imported_host_pointer_alignment);
 
-  // [BR] Read the pointer value as a pointer, then convert. The previous
+  // Read the pointer value as a pointer, then convert. The previous
   // *((VkDeviceSize*)host_ptr) reinterpreted a void* object as uint64_t
   // (strict-aliasing UB); with inlining it read 0 and produced a NULL import
   // pointer (VK_ERROR_UNKNOWN from vkAllocateMemory).
   VkDeviceSize unaligned_addr = (VkDeviceSize)(uintptr_t)(*host_ptr);
-
 
   VkDeviceSize aligned_addr =
       (unaligned_addr / desired_alignment) * desired_alignment;
@@ -660,6 +659,10 @@ static iree_status_t iree_hal_vulkan_native_allocator_import_host_buffer(
         "external host memory import is not supported on this device");
   }
 
+  // Disabled: the shared buffer bridge imports local-task buffers, and large
+  // heap allocations are anonymous mmap memory, on which msync succeeds, so
+  // this check rejected those imports. The mesa issue it guards against
+  // concerns file-backed mappings.
 #if 0 && defined(IREE_PLATFORM_LINUX)
   // First check if the memory is importable.
   // Some drivers incorrectly succeed when attempting to import already-mapped
@@ -758,9 +761,6 @@ static iree_status_t iree_hal_vulkan_native_allocator_import_host_buffer(
   allocate_info.pNext = &import_host_ptr_info;
   VkDeviceMemory device_memory = VK_NULL_HANDLE;
 
-
-
-
   IREE_TRACE_ZONE_BEGIN_NAMED(z_c, "vkAllocateMemory");
   status = VK_RESULT_TO_STATUS(logical_device->syms()->vkAllocateMemory(
                                    *logical_device, &allocate_info,
@@ -843,7 +843,6 @@ static void iree_hal_vulkan_native_allocator_imported_fd_buffer_release(
   }
 }
 
-
 static iree_status_t iree_hal_vulkan_native_allocator_wrap_device_memory(
     iree_hal_allocator_t* IREE_RESTRICT base_allocator,
     const iree_hal_buffer_params_t* IREE_RESTRICT params,
@@ -851,7 +850,6 @@ static iree_status_t iree_hal_vulkan_native_allocator_wrap_device_memory(
     iree_hal_vulkan_native_buffer_release_fn_t internal_release_fn,
     iree_hal_buffer_release_callback_t release_callback,
     iree_hal_buffer_t** IREE_RESTRICT out_buffer);
-
 
 static iree_status_t iree_hal_vulkan_native_allocator_import_opaque_fd_buffer(
     iree_hal_allocator_t* IREE_RESTRICT base_allocator,
@@ -941,8 +939,6 @@ static iree_status_t iree_hal_vulkan_native_allocator_import_opaque_fd_buffer(
   return status;
 }
 
-
-
 static iree_status_t iree_hal_vulkan_native_allocator_wrap_device_memory(
     iree_hal_allocator_t* IREE_RESTRICT base_allocator,
     const iree_hal_buffer_params_t* IREE_RESTRICT params,
@@ -1031,12 +1027,10 @@ static iree_status_t iree_hal_vulkan_native_allocator_import_buffer(
           base_allocator, params, external_buffer, release_callback,
           out_buffer);
 
-
     case IREE_HAL_EXTERNAL_BUFFER_TYPE_OPAQUE_FD:
       return iree_hal_vulkan_native_allocator_import_opaque_fd_buffer(
           base_allocator, params, external_buffer, release_callback,
           out_buffer);
-
 
     default:
       return iree_make_status(IREE_STATUS_UNIMPLEMENTED,

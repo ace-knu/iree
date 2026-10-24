@@ -218,7 +218,7 @@ static iree_status_t iree_tooling_annotate_status_with_function_decl(
   return base_status;
 }
 
-// 3DEV: Finds the first device in |group| whose hal.device.id matches the
+// Finds the first device in |group| whose hal.device.id matches the
 // pattern "<id>*" (the same query the compiled module uses to bind its
 // @__device_N globals, e.g. "local" -> local-task). Returns false if none.
 static bool iree_tooling_find_device_by_id(iree_hal_device_group_t* group,
@@ -275,7 +275,7 @@ static iree_status_t iree_tooling_run_function(
   }
 
   // EXPERIMENT: relocate inputs to per-input devices.
-  // 3DEV: explicit --input_device wins; without it the compiler-recorded
+  // Explicit --input_device wins; without it the compiler-recorded
   // reflection amdaie.input_devices ("amdxdna,,vulkan|local") is used:
   //   ""  never imported -> left alone
   //   "?" no device all importers can read -> error, never guessed
