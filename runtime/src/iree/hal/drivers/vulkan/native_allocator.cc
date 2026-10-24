@@ -16,6 +16,7 @@
 
 #if defined(IREE_PLATFORM_LINUX)
 #include <sys/mman.h>
+#include <unistd.h>
 #endif  // IREE_PLATFORM_LINUX
 
 using namespace iree::hal::vulkan;
@@ -827,11 +828,27 @@ static void iree_hal_vulkan_native_allocator_external_device_buffer_release(
   }
 }
 
+// Releases a buffer whose device memory was allocated by the opaque-fd import:
+// both the buffer handle and the device memory are ours.
+static void iree_hal_vulkan_native_allocator_imported_fd_buffer_release(
+    void* user_data, iree::hal::vulkan::VkDeviceHandle* logical_device,
+    VkDeviceMemory device_memory, VkBuffer handle) {
+  if (handle) {
+    logical_device->syms()->vkDestroyBuffer(*logical_device, handle,
+                                            logical_device->allocator());
+  }
+  if (device_memory) {
+    logical_device->syms()->vkFreeMemory(*logical_device, device_memory,
+                                         logical_device->allocator());
+  }
+}
 
-static iree_status_t iree_hal_vulkan_native_allocator_import_device_buffer(
+
+static iree_status_t iree_hal_vulkan_native_allocator_wrap_device_memory(
     iree_hal_allocator_t* IREE_RESTRICT base_allocator,
     const iree_hal_buffer_params_t* IREE_RESTRICT params,
     iree_hal_external_buffer_t* IREE_RESTRICT external_buffer,
+    iree_hal_vulkan_native_buffer_release_fn_t internal_release_fn,
     iree_hal_buffer_release_callback_t release_callback,
     iree_hal_buffer_t** IREE_RESTRICT out_buffer);
 
@@ -846,13 +863,17 @@ static iree_status_t iree_hal_vulkan_native_allocator_import_opaque_fd_buffer(
       iree_hal_vulkan_native_allocator_cast(base_allocator);
   VkDeviceHandle* logical_device = allocator->logical_device;
 
-  if (!logical_device->enabled_extensions().external_memory_fd) {
-    return iree_make_status(IREE_STATUS_UNAVAILABLE,
-                            "VK_KHR_external_memory_fd not enabled");
-  }
+  // The import takes ownership of |fd| on every path: a successful
+  // vkAllocateMemory transfers it to the driver (per the Vulkan spec), and the
+  // failure paths before that close it here.
   int fd = external_buffer->handle.opaque_fd.fd;
   if (IREE_UNLIKELY(fd < 0)) {
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "invalid fd");
+  }
+  iree_status_t status = iree_ok_status();
+  if (!logical_device->enabled_extensions().external_memory_fd) {
+    status = iree_make_status(IREE_STATUS_UNAVAILABLE,
+                              "VK_KHR_external_memory_fd not enabled");
   }
 
   // dma-buf imports must use the dma-buf handle type; the driver tells us
@@ -864,17 +885,20 @@ static iree_status_t iree_hal_vulkan_native_allocator_import_opaque_fd_buffer(
 
   VkMemoryFdPropertiesKHR fd_props = {};
   fd_props.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
-  IREE_RETURN_IF_ERROR(VK_RESULT_TO_STATUS(
-      logical_device->syms()->vkGetMemoryFdPropertiesKHR(
-          *logical_device, handle_type, fd, &fd_props),
-      "vkGetMemoryFdPropertiesKHR"));
+  if (iree_status_is_ok(status)) {
+    status = VK_RESULT_TO_STATUS(
+        logical_device->syms()->vkGetMemoryFdPropertiesKHR(
+            *logical_device, handle_type, fd, &fd_props),
+        "vkGetMemoryFdPropertiesKHR");
+  }
 
   uint32_t memory_type_index = 0;
-  IREE_RETURN_IF_ERROR(iree_hal_vulkan_find_memory_type(
-      &allocator->device_props, &allocator->memory_props, params,
-      /*allowed_type_indices=*/fd_props.memoryTypeBits, &memory_type_index));
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_vulkan_find_memory_type(
+        &allocator->device_props, &allocator->memory_props, params,
+        /*allowed_type_indices=*/fd_props.memoryTypeBits, &memory_type_index);
+  }
 
-  // The driver dups the fd during import, so ownership stays with the caller.
   VkImportMemoryFdInfoKHR import_info = {};
   import_info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
   import_info.handleType = handle_type;
@@ -887,27 +911,43 @@ static iree_status_t iree_hal_vulkan_native_allocator_import_opaque_fd_buffer(
   allocate_info.memoryTypeIndex = memory_type_index;
 
   VkDeviceMemory device_memory = VK_NULL_HANDLE;
-  IREE_RETURN_IF_ERROR(VK_RESULT_TO_STATUS(
-      logical_device->syms()->vkAllocateMemory(*logical_device, &allocate_info,
-                                               logical_device->allocator(),
-                                               &device_memory),
-      "vkAllocateMemory"));
+  if (iree_status_is_ok(status)) {
+    status = VK_RESULT_TO_STATUS(
+        logical_device->syms()->vkAllocateMemory(
+            *logical_device, &allocate_info, logical_device->allocator(),
+            &device_memory),
+        "vkAllocateMemory");
+  }
+  if (!iree_status_is_ok(status)) {
+#if defined(IREE_PLATFORM_LINUX)
+    close(fd);
+#endif  // IREE_PLATFORM_LINUX
+    return status;
+  }
 
-  // Hand off to the device-allocation path, which wraps a VkBuffer around the
-  // VkDeviceMemory we just created.
+  // Wrap a VkBuffer around the VkDeviceMemory we just created. The wrapped
+  // buffer owns the memory and frees it on release.
   iree_hal_external_buffer_t device_buffer = *external_buffer;
   device_buffer.type = IREE_HAL_EXTERNAL_BUFFER_TYPE_DEVICE_ALLOCATION;
   device_buffer.handle.device_allocation.ptr = (uint64_t)device_memory;
-  return iree_hal_vulkan_native_allocator_import_device_buffer(
-      base_allocator, params, &device_buffer, release_callback, out_buffer);
+  status = iree_hal_vulkan_native_allocator_wrap_device_memory(
+      base_allocator, params, &device_buffer,
+      iree_hal_vulkan_native_allocator_imported_fd_buffer_release,
+      release_callback, out_buffer);
+  if (!iree_status_is_ok(status)) {
+    logical_device->syms()->vkFreeMemory(*logical_device, device_memory,
+                                         logical_device->allocator());
+  }
+  return status;
 }
 
 
 
-static iree_status_t iree_hal_vulkan_native_allocator_import_device_buffer(
+static iree_status_t iree_hal_vulkan_native_allocator_wrap_device_memory(
     iree_hal_allocator_t* IREE_RESTRICT base_allocator,
     const iree_hal_buffer_params_t* IREE_RESTRICT params,
     iree_hal_external_buffer_t* IREE_RESTRICT external_buffer,
+    iree_hal_vulkan_native_buffer_release_fn_t internal_release_fn,
     iree_hal_buffer_release_callback_t release_callback,
     iree_hal_buffer_t** IREE_RESTRICT out_buffer) {
   iree_hal_vulkan_native_allocator_t* allocator =
@@ -952,8 +992,7 @@ static iree_status_t iree_hal_vulkan_native_allocator_import_device_buffer(
   };
   iree_hal_vulkan_native_buffer_release_callback_t internal_release_callback = {
       0};
-  internal_release_callback.fn =
-      iree_hal_vulkan_native_allocator_external_device_buffer_release;
+  internal_release_callback.fn = internal_release_fn;
   internal_release_callback.user_data = NULL;
   return iree_hal_vulkan_native_buffer_wrap(
       placement, params->type, params->access, params->usage,
@@ -962,6 +1001,18 @@ static iree_status_t iree_hal_vulkan_native_allocator_import_device_buffer(
       /*byte_length=*/external_buffer->size, logical_device, device_memory,
       handle, internal_release_callback, release_callback,
       allocator->host_allocator, out_buffer);
+}
+
+static iree_status_t iree_hal_vulkan_native_allocator_import_device_buffer(
+    iree_hal_allocator_t* IREE_RESTRICT base_allocator,
+    const iree_hal_buffer_params_t* IREE_RESTRICT params,
+    iree_hal_external_buffer_t* IREE_RESTRICT external_buffer,
+    iree_hal_buffer_release_callback_t release_callback,
+    iree_hal_buffer_t** IREE_RESTRICT out_buffer) {
+  return iree_hal_vulkan_native_allocator_wrap_device_memory(
+      base_allocator, params, external_buffer,
+      iree_hal_vulkan_native_allocator_external_device_buffer_release,
+      release_callback, out_buffer);
 }
 
 static iree_status_t iree_hal_vulkan_native_allocator_import_buffer(
