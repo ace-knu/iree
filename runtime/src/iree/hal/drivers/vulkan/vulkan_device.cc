@@ -1675,22 +1675,15 @@ static iree_status_t iree_hal_vulkan_device_create_channel(
                           "collectives not implemented");
 }
 
-static iree_status_t iree_hal_vulkan_device_create_command_buffer(
+// Creates a command buffer that records directly into a VkCommandBuffer. Only
+// queue_execute uses it, to translate the deferred command buffers that
+// iree_hal_vulkan_device_create_command_buffer returns.
+static iree_status_t iree_hal_vulkan_device_create_direct_command_buffer(
     iree_hal_device_t* base_device, iree_hal_command_buffer_mode_t mode,
     iree_hal_command_category_t command_categories,
-    iree_hal_queue_affinity_t queue_affinity, iree_host_size_t binding_capacity,
+    iree_hal_queue_affinity_t queue_affinity,
     iree_hal_command_buffer_t** out_command_buffer) {
   iree_hal_vulkan_device_t* device = iree_hal_vulkan_device_cast(base_device);
-
-  // TODO(indirect-cmd): until implemented through the whole stack we use a
-  // deferred command buffer and then translate that to a concrete Vulkan
-  // command buffer when submitted with bindings.
-  if (binding_capacity > 0) {
-    return iree_hal_deferred_command_buffer_create(
-        iree_hal_device_allocator(base_device), mode, command_categories,
-        queue_affinity, binding_capacity, &device->block_pool,
-        iree_hal_device_host_allocator(base_device), out_command_buffer);
-  }
 
   // TODO(scotttodd): revisit queue selection logic and remove this
   //   * the unaligned buffer fill polyfill and tracing timestamp queries may
@@ -1722,9 +1715,32 @@ static iree_status_t iree_hal_vulkan_device_create_command_buffer(
 
   return iree_hal_vulkan_direct_command_buffer_allocate(
       iree_hal_device_allocator(base_device), device->logical_device,
-      command_pool, mode, command_categories, queue_affinity, binding_capacity,
-      queue->tracing_context(), device->descriptor_pool_cache,
-      device->builtin_executables, &device->block_pool, out_command_buffer);
+      command_pool, mode, command_categories, queue_affinity,
+      /*binding_capacity=*/0, queue->tracing_context(),
+      device->descriptor_pool_cache, device->builtin_executables,
+      &device->block_pool, out_command_buffer);
+}
+
+static iree_status_t iree_hal_vulkan_device_create_command_buffer(
+    iree_hal_device_t* base_device, iree_hal_command_buffer_mode_t mode,
+    iree_hal_command_category_t command_categories,
+    iree_hal_queue_affinity_t queue_affinity, iree_host_size_t binding_capacity,
+    iree_hal_command_buffer_t** out_command_buffer) {
+  iree_hal_vulkan_device_t* device = iree_hal_vulkan_device_cast(base_device);
+
+  // TODO(indirect-cmd): until implemented through the whole stack we use a
+  // deferred command buffer and then translate that to a concrete Vulkan
+  // command buffer when submitted with bindings.
+  // BRIDGE: one-shot command buffers (no binding table) are deferred as well.
+  // Buffers owned by other devices are imported while the VkCommandBuffer is
+  // recorded, and a queue-ordered (transient) buffer of another device has
+  // no memory until its alloca executes. Recording every command buffer in
+  // queue_execute, after the waits on the other devices, covers the one-shot
+  // command buffers the VM records and the emulated queue fill/copy/update.
+  return iree_hal_deferred_command_buffer_create(
+      iree_hal_device_allocator(base_device), mode, command_categories,
+      queue_affinity, binding_capacity, &device->block_pool,
+      iree_hal_device_host_allocator(base_device), out_command_buffer);
 }
 
 static iree_status_t iree_hal_vulkan_device_create_event(
@@ -1861,13 +1877,31 @@ static iree_status_t iree_hal_vulkan_device_queue_write(
       options);
 }
 
-static iree_status_t iree_hal_vulkan_device_queue_execute(
+// BRIDGE: waits on the host for the entries of |semaphore_list| that belong to
+// other devices (not Vulkan semaphores). Vulkan cannot import them as Vulkan
+// semaphores, so they cannot be waited on by the GPU.
+static iree_status_t iree_hal_vulkan_device_wait_foreign_semaphores(
+    const iree_hal_semaphore_list_t semaphore_list) {
+  for (iree_host_size_t i = 0; i < semaphore_list.count; ++i) {
+    iree_hal_semaphore_t* semaphore = semaphore_list.semaphores[i];
+    if (iree_hal_vulkan_native_semaphore_isa(semaphore)) continue;
+    IREE_RETURN_IF_ERROR(iree_hal_semaphore_wait(
+        semaphore, semaphore_list.payload_values[i], iree_infinite_timeout(),
+        IREE_ASYNC_WAIT_FLAG_NONE));
+  }
+  return iree_ok_status();
+}
+
+// Records |command_buffer| into a VkCommandBuffer (importing the buffers that
+// other devices own), submits it and registers its Vulkan signal semaphores
+// with the completion watcher. The waits on other devices' semaphores in
+// |wait_semaphore_list| must already be satisfied (see queue_execute).
+static iree_status_t iree_hal_vulkan_device_issue_execute(
     iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
     const iree_hal_semaphore_list_t wait_semaphore_list,
     const iree_hal_semaphore_list_t signal_semaphore_list,
     iree_hal_command_buffer_t* command_buffer,
-    iree_hal_buffer_binding_table_t binding_table,
-    iree_hal_execute_flags_t flags) {
+    iree_hal_buffer_binding_table_t binding_table) {
   iree_hal_vulkan_device_t* device = iree_hal_vulkan_device_cast(base_device);
 
   // NOTE: today we are not discriminating queues based on command type.
@@ -1883,7 +1917,7 @@ static iree_status_t iree_hal_vulkan_device_queue_execute(
   iree_status_t status = iree_ok_status();
   if (command_buffer != NULL) {
     if (iree_hal_deferred_command_buffer_isa(command_buffer)) {
-      status = iree_hal_vulkan_device_create_command_buffer(
+      status = iree_hal_vulkan_device_create_direct_command_buffer(
           base_device,
           iree_hal_command_buffer_mode(command_buffer) |
               IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT |
@@ -1893,7 +1927,7 @@ static iree_status_t iree_hal_vulkan_device_queue_execute(
                    ? IREE_HAL_COMMAND_BUFFER_MODE_UNVALIDATED
                    : 0),
           iree_hal_command_buffer_allowed_categories(command_buffer),
-          queue_affinity, /*binding_capacity=*/0, &translated_command_buffer);
+          queue_affinity, &translated_command_buffer);
       if (iree_status_is_ok(status)) {
         status = iree_hal_deferred_command_buffer_apply(
             command_buffer, translated_command_buffer, binding_table);
@@ -1968,6 +2002,36 @@ static iree_status_t iree_hal_vulkan_device_queue_execute(
   }
 
   return status;
+}
+
+static iree_status_t iree_hal_vulkan_device_queue_execute(
+    iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
+    const iree_hal_semaphore_list_t wait_semaphore_list,
+    const iree_hal_semaphore_list_t signal_semaphore_list,
+    iree_hal_command_buffer_t* command_buffer,
+    iree_hal_buffer_binding_table_t binding_table,
+    iree_hal_execute_flags_t flags) {
+  // BRIDGE: buffers owned by other devices are imported while the command
+  // buffer is recorded (issue_execute). A queue-ordered (transient) buffer of
+  // another device has no memory until its alloca executes, and the alloca
+  // signals that device's semaphore, which this submission waits on directly
+  // or through the semaphores of other devices. Wait for the other devices'
+  // semaphores on the host before recording, as the other HAL drivers resolve
+  // bindings only after the waits are satisfied. The Vulkan semaphores are
+  // still waited on by the GPU, and the host wait in
+  // DirectCommandQueue::Submit then finds the other ones already reached.
+  // This is the same host wait Submit did before, only earlier; making it
+  // asynchronous would call issue_execute from the wait callbacks.
+  iree_status_t status =
+      iree_hal_vulkan_device_wait_foreign_semaphores(wait_semaphore_list);
+  if (!iree_status_is_ok(status)) {
+    iree_hal_semaphore_list_fail(signal_semaphore_list,
+                                 iree_status_clone(status));
+    return status;
+  }
+  return iree_hal_vulkan_device_issue_execute(
+      base_device, queue_affinity, wait_semaphore_list, signal_semaphore_list,
+      command_buffer, binding_table);
 }
 
 static iree_status_t iree_hal_vulkan_device_queue_flush(
