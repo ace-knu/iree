@@ -40,9 +40,11 @@ void iree_hal_vulkan_completion_watcher_destroy(
 // The watcher will monitor each semaphore in |signal_semaphores| and, upon GPU
 // completion, synchronize the host-side async timeline and dispatch timepoints.
 //
-// Ownership of |resource_set| transfers to the watcher — it will be freed when
-// the last semaphore in the list reaches its target value. If |resource_set| is
-// NULL, no resources are freed on completion.
+// Ownership of |resource_set| transfers to the watcher, also when registration
+// fails. It is freed when the first semaphore in the list is observed at its
+// target value, before any semaphore of the list is signaled, so a waiter that
+// wakes up never sees the submission's resources still retained. If
+// |resource_set| is NULL, no resources are freed on completion.
 //
 // Thread-safe. Non-blocking. Wakes the watcher thread to include the new
 // semaphores in its next wait set.
