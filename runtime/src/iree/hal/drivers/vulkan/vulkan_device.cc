@@ -1768,7 +1768,8 @@ static iree_status_t iree_hal_vulkan_device_create_semaphore(
     iree_hal_semaphore_t** out_semaphore) {
   iree_hal_vulkan_device_t* device = iree_hal_vulkan_device_cast(base_device);
   return iree_hal_vulkan_native_semaphore_create(
-      device->logical_device, device->proactor, initial_value, out_semaphore);
+      device->logical_device, device->proactor, device->completion_watcher,
+      initial_value, out_semaphore);
 }
 
 static iree_hal_semaphore_compatibility_t

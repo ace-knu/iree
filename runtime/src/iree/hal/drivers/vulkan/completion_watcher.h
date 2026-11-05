@@ -30,10 +30,20 @@ iree_status_t iree_hal_vulkan_completion_watcher_create(
     iree_allocator_t host_allocator,
     iree_hal_vulkan_completion_watcher_t** out_watcher);
 
-// Shuts down the watcher: signals exit, joins the thread, and frees any
-// remaining resource sets. All command queues should be drained before calling
-// this so that outstanding GPU work has completed.
+// Shuts down the watcher: signals exit, joins the thread, frees any remaining
+// resource sets, and drops the reference taken by create. All command queues
+// should be drained before calling this so that outstanding GPU work has
+// completed. The watcher memory stays valid while other references (Vulkan
+// semaphores) remain.
 void iree_hal_vulkan_completion_watcher_destroy(
+    iree_hal_vulkan_completion_watcher_t* watcher);
+
+// Reference counting. Vulkan semaphores retain the device's watcher so they can
+// call iree_hal_vulkan_completion_watcher_release_completed even if they
+// outlive the device. |watcher| may be NULL.
+void iree_hal_vulkan_completion_watcher_retain(
+    iree_hal_vulkan_completion_watcher_t* watcher);
+void iree_hal_vulkan_completion_watcher_release(
     iree_hal_vulkan_completion_watcher_t* watcher);
 
 // Registers signal semaphores from a queue submission for completion tracking.

@@ -18,13 +18,20 @@
 extern "C" {
 #endif  // __cplusplus
 
+typedef struct iree_hal_vulkan_completion_watcher_t
+    iree_hal_vulkan_completion_watcher_t;
+
 // Creates a timeline semaphore implemented using the native VkSemaphore type.
 // |proactor| is borrowed from the device's proactor pool and must outlive the
-// semaphore.
+// semaphore. |completion_watcher| (may be NULL) is retained: when a host query
+// or wait observes a value the watcher has not signaled yet, the semaphore
+// first frees the resources of every completed submission through it, so a
+// completion seen this way follows the same rule as the watcher's signals.
 iree_status_t iree_hal_vulkan_native_semaphore_create(
     iree::hal::vulkan::VkDeviceHandle* logical_device,
-    iree_async_proactor_t* proactor, uint64_t initial_value,
-    iree_hal_semaphore_t** out_semaphore);
+    iree_async_proactor_t* proactor,
+    iree_hal_vulkan_completion_watcher_t* completion_watcher,
+    uint64_t initial_value, iree_hal_semaphore_t** out_semaphore);
 
 // Returns true if |semaphore| is a Vulkan native semaphore.
 bool iree_hal_vulkan_native_semaphore_isa(iree_hal_semaphore_t* semaphore);

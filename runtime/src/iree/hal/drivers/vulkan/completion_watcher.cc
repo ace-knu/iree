@@ -75,6 +75,11 @@ typedef struct iree_hal_vulkan_completion_entry_t {
 //===----------------------------------------------------------------------===//
 
 struct iree_hal_vulkan_completion_watcher_t {
+  // The device holds one reference and each Vulkan semaphore holds one, so a
+  // semaphore that outlives the device can still call
+  // iree_hal_vulkan_completion_watcher_release_completed safely (it finds
+  // nothing in flight after the device shut the watcher down).
+  iree_atomic_ref_count_t ref_count;
   iree_thread_t* thread;
   iree_allocator_t host_allocator;
 
@@ -513,6 +518,7 @@ iree_status_t iree_hal_vulkan_completion_watcher_create(
       z0, iree_allocator_malloc(host_allocator, sizeof(*watcher),
                                 (void**)&watcher));
   memset(watcher, 0, sizeof(*watcher));
+  iree_atomic_ref_count_init(&watcher->ref_count);
   watcher->host_allocator = host_allocator;
   watcher->logical_device = logical_device;
   iree_atomic_store(&watcher->poke_next_value, 0, iree_memory_order_release);
@@ -623,13 +629,30 @@ void iree_hal_vulkan_completion_watcher_destroy(
   // Free arrays. active_entries is the base of the combined allocation that
   // also contains wait_semaphores and wait_values.
   iree_allocator_free(watcher->host_allocator, watcher->pending_entries);
+  watcher->pending_entries = NULL;
+  watcher->pending_count = 0;
   iree_allocator_free(watcher->host_allocator, watcher->active_entries);
-  iree_slim_mutex_deinitialize(&watcher->mutex);
+  watcher->active_entries = NULL;
+  watcher->active_count = 0;
 
-  iree_allocator_t host_allocator = watcher->host_allocator;
-  iree_allocator_free(host_allocator, watcher);
+  // Drop the device's reference. Semaphores still alive keep the (now empty)
+  // watcher until they are destroyed.
+  iree_hal_vulkan_completion_watcher_release(watcher);
 
   IREE_TRACE_ZONE_END(z0);
+}
+
+void iree_hal_vulkan_completion_watcher_retain(
+    iree_hal_vulkan_completion_watcher_t* watcher) {
+  if (watcher) iree_atomic_ref_count_inc(&watcher->ref_count);
+}
+
+void iree_hal_vulkan_completion_watcher_release(
+    iree_hal_vulkan_completion_watcher_t* watcher) {
+  if (!watcher || iree_atomic_ref_count_dec(&watcher->ref_count) != 1) return;
+  iree_slim_mutex_deinitialize(&watcher->mutex);
+  iree_allocator_t host_allocator = watcher->host_allocator;
+  iree_allocator_free(host_allocator, watcher);
 }
 
 void iree_hal_vulkan_completion_watcher_release_completed(
@@ -639,10 +662,12 @@ void iree_hal_vulkan_completion_watcher_release_completed(
   // under the mutex and finishes before its caller proceeds.
   if (iree_hal_vulkan_completion_watcher_releasing == watcher) return;
   IREE_TRACE_ZONE_BEGIN(z0);
-  auto* syms = watcher->logical_device->syms().get();
-  VkDevice vk_device = *watcher->logical_device;
   iree_slim_mutex_lock(&watcher->mutex);
   iree_hal_vulkan_completion_batch_t* batch = watcher->in_flight_head;
+  // Nothing in flight (also after the device shut the watcher down): do not
+  // touch the device.
+  auto* syms = batch ? watcher->logical_device->syms().get() : nullptr;
+  VkDevice vk_device = batch ? (VkDevice)*watcher->logical_device : VK_NULL_HANDLE;
   while (batch) {
     iree_hal_vulkan_completion_batch_t* next_batch = batch->next;
     uint64_t value = 0;

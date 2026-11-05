@@ -10,6 +10,7 @@
 
 #include "iree/async/semaphore.h"
 #include "iree/base/api.h"
+#include "iree/hal/drivers/vulkan/completion_watcher.h"
 #include "iree/hal/drivers/vulkan/dynamic_symbol_tables.h"
 #include "iree/hal/drivers/vulkan/dynamic_symbols.h"
 #include "iree/hal/drivers/vulkan/status_util.h"
@@ -21,6 +22,9 @@ typedef struct iree_hal_vulkan_native_semaphore_t {
   iree_async_semaphore_t async;
   VkDeviceHandle* logical_device;
   VkSemaphore handle;
+  // The device's completion watcher (retained, may be NULL). See
+  // iree_hal_vulkan_native_semaphore_release_before_visible.
+  iree_hal_vulkan_completion_watcher_t* completion_watcher;
 } iree_hal_vulkan_native_semaphore_t;
 
 namespace {
@@ -36,8 +40,9 @@ iree_hal_vulkan_native_semaphore_cast(iree_hal_semaphore_t* base_value) {
 
 iree_status_t iree_hal_vulkan_native_semaphore_create(
     iree::hal::vulkan::VkDeviceHandle* logical_device,
-    iree_async_proactor_t* proactor, uint64_t initial_value,
-    iree_hal_semaphore_t** out_semaphore) {
+    iree_async_proactor_t* proactor,
+    iree_hal_vulkan_completion_watcher_t* completion_watcher,
+    uint64_t initial_value, iree_hal_semaphore_t** out_semaphore) {
   IREE_ASSERT_ARGUMENT(logical_device);
   IREE_ASSERT_ARGUMENT(proactor);
   IREE_ASSERT_ARGUMENT(out_semaphore);
@@ -75,6 +80,8 @@ iree_status_t iree_hal_vulkan_native_semaphore_create(
         proactor, initial_value, frontier_offset, 0, &semaphore->async);
     semaphore->logical_device = logical_device;
     semaphore->handle = handle;
+    semaphore->completion_watcher = completion_watcher;
+    iree_hal_vulkan_completion_watcher_retain(completion_watcher);
     *out_semaphore = iree_hal_semaphore_cast(&semaphore->async);
   } else {
     logical_device->syms()->vkDestroySemaphore(*logical_device, handle,
@@ -96,6 +103,7 @@ static void iree_hal_vulkan_native_semaphore_destroy(
   semaphore->logical_device->syms()->vkDestroySemaphore(
       *semaphore->logical_device, semaphore->handle,
       semaphore->logical_device->allocator());
+  iree_hal_vulkan_completion_watcher_release(semaphore->completion_watcher);
 
   iree_async_semaphore_deinitialize(&semaphore->async);
   iree_allocator_free(host_allocator, semaphore);
@@ -113,6 +121,27 @@ VkSemaphore iree_hal_vulkan_native_semaphore_handle(
   iree_hal_vulkan_native_semaphore_t* semaphore =
       iree_hal_vulkan_native_semaphore_cast(base_semaphore);
   return semaphore->handle;
+}
+
+// A host query or wait read |value| straight from Vulkan, without the
+// completion watcher. If the watcher has not signaled that value yet, the
+// completion is about to become visible outside of it (returned to the caller
+// or dispatched to timepoints), so first free the resources of every completed
+// submission, as the watcher does before it signals: a caller that learns of
+// the completion this way (for example a CPU queue checking its waits) may
+// finish the program and tear down the VM context right away, and a retained
+// binding imported from module rodata would make iree_vm_buffer_deinitialize
+// abort.
+//
+// NOTE(fork): upstream reads and dispatches here without this step.
+static void iree_hal_vulkan_native_semaphore_release_before_visible(
+    iree_hal_vulkan_native_semaphore_t* semaphore, uint64_t value) {
+  iree_async_semaphore_t* async_sem = &semaphore->async;
+  if ((int64_t)value > iree_atomic_load(&async_sem->timeline_value,
+                                        iree_memory_order_acquire)) {
+    iree_hal_vulkan_completion_watcher_release_completed(
+        semaphore->completion_watcher);
+  }
 }
 
 static uint64_t iree_hal_vulkan_native_semaphore_query(
@@ -150,6 +179,8 @@ static uint64_t iree_hal_vulkan_native_semaphore_query(
     }
     return IREE_HAL_SEMAPHORE_FAILURE_VALUE;
   }
+
+  iree_hal_vulkan_native_semaphore_release_before_visible(semaphore, value);
 
   // Sync the timeline to the Vulkan-queried value. We use an atomic store
   // rather than the normal signal path because queries can return the same
@@ -254,6 +285,13 @@ static iree_status_t iree_hal_vulkan_native_semaphore_wait(
 
   if (result == VK_SUCCESS) {
     iree_async_semaphore_t* async_sem = (iree_async_semaphore_t*)base_semaphore;
+
+    // The wait saw the value straight from Vulkan; returning makes it visible
+    // to the caller. Free the resources of every completed submission first
+    // (see iree_hal_vulkan_native_semaphore_release_before_visible). A blocking
+    // wait is not a hot path, so do it unconditionally.
+    iree_hal_vulkan_completion_watcher_release_completed(
+        semaphore->completion_watcher);
 
     // Check if the semaphore was failed (on_fail signals the VkSemaphore to
     // IREE_HAL_SEMAPHORE_FAILURE_VALUE which satisfies any vkWaitSemaphores
