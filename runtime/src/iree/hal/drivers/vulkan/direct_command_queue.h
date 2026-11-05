@@ -10,6 +10,7 @@
 #include "iree/base/api.h"
 #include "iree/hal/api.h"
 #include "iree/hal/drivers/vulkan/command_queue.h"
+#include "iree/hal/drivers/vulkan/completion_watcher.h"
 #include "iree/hal/drivers/vulkan/handle_util.h"
 #include "iree/hal/drivers/vulkan/util/arena.h"
 
@@ -31,12 +32,22 @@ class DirectCommandQueue final : public CommandQueue {
 
   iree_status_t WaitIdle(iree_timeout_t timeout) override;
 
+  // The device's completion watcher. Submit calls
+  // iree_hal_vulkan_completion_watcher_release_completed on it before it
+  // signals other devices' semaphores from the host (BRIDGE). Borrowed; the
+  // device destroys its queues before the watcher.
+  void set_completion_watcher(iree_hal_vulkan_completion_watcher_t* watcher) {
+    completion_watcher_ = watcher;
+  }
+
  private:
   iree_status_t TranslateBatchInfo(
       const iree_hal_vulkan_submission_batch_t* batch,
       VkSubmitInfo* submit_info,
       VkTimelineSemaphoreSubmitInfo* timeline_submit_info, Arena* arena,
       bool* out_has_foreign_signal);
+
+  iree_hal_vulkan_completion_watcher_t* completion_watcher_ = nullptr;
 };
 
 }  // namespace vulkan

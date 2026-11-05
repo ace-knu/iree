@@ -35,6 +35,30 @@ using namespace iree::hal::vulkan;
 // Completion entry
 //===----------------------------------------------------------------------===//
 
+// Resources of one registered submission, shared by the entries of all of its
+// signal semaphores (one vkQueueSubmit signals them all).
+typedef struct iree_hal_vulkan_completion_batch_t {
+  // Resources retained until the submission completes. Guarded by the watcher
+  // mutex. While non-NULL the batch is linked into the watcher's in-flight
+  // list. Freed by the first thread that observes the submission complete in
+  // iree_hal_vulkan_completion_watcher_release_completed (before anything
+  // signals), by fail_all, or with the last entry if the submission never
+  // completed (its semaphores were failed).
+  iree_hal_resource_set_t* resource_set;
+  // One of the submission's signal semaphores and its target value, used to
+  // check whether the submission completed. All signal semaphores of one
+  // vkQueueSubmit are signaled together, so one is enough.
+  VkSemaphore vk_semaphore;
+  uint64_t target_value;
+  // In-flight list links. Guarded by the watcher mutex.
+  struct iree_hal_vulkan_completion_batch_t* prev;
+  struct iree_hal_vulkan_completion_batch_t* next;
+  bool in_flight;
+  // Entries still referencing this batch. The last one frees the batch. Only
+  // the watcher thread changes it after registration.
+  iree_host_size_t entry_count;
+} iree_hal_vulkan_completion_batch_t;
+
 typedef struct iree_hal_vulkan_completion_entry_t {
   // HAL semaphore being watched. Retained by the watcher.
   iree_hal_semaphore_t* semaphore;
@@ -42,10 +66,8 @@ typedef struct iree_hal_vulkan_completion_entry_t {
   VkSemaphore vk_semaphore;
   // Target timeline value that indicates this entry's work is complete.
   uint64_t target_value;
-  // Resources retained until this entry completes. Freed on completion.
-  // May be NULL if no resources need to be retained (earlier entries in a
-  // multi-semaphore submission where the resource set is on the last entry).
-  iree_hal_resource_set_t* resource_set;
+  // Resources of the submission this entry belongs to.
+  iree_hal_vulkan_completion_batch_t* batch;
 } iree_hal_vulkan_completion_entry_t;
 
 //===----------------------------------------------------------------------===//
@@ -53,6 +75,11 @@ typedef struct iree_hal_vulkan_completion_entry_t {
 //===----------------------------------------------------------------------===//
 
 struct iree_hal_vulkan_completion_watcher_t {
+  // The device holds one reference and each Vulkan semaphore holds one, so a
+  // semaphore that outlives the device can still call
+  // iree_hal_vulkan_completion_watcher_release_completed safely (it finds
+  // nothing in flight after the device shut the watcher down).
+  iree_atomic_ref_count_t ref_count;
   iree_thread_t* thread;
   iree_allocator_t host_allocator;
 
@@ -70,9 +97,13 @@ struct iree_hal_vulkan_completion_watcher_t {
   // the wait target (poke_last_value + 1). Watcher-local, no sync needed.
   uint64_t poke_last_value;
 
-  // Protects pending_entries, pending_count, and do_exit. Held briefly by
-  // submitters to append entries and by the watcher to drain them.
+  // Protects pending_entries, pending_count, do_exit, and the in-flight list
+  // (including each batch's resource_set). Held briefly by submitters to append
+  // entries, by the watcher to drain them, and by any thread that frees the
+  // resources of completed submissions (the frees run under it).
   iree_slim_mutex_t mutex;
+  // Submissions whose resources are still retained, newest first.
+  iree_hal_vulkan_completion_batch_t* in_flight_head;
   iree_hal_vulkan_completion_entry_t* pending_entries;
   iree_host_size_t pending_count;
   iree_host_size_t pending_capacity;
@@ -164,16 +195,73 @@ static iree_status_t iree_hal_vulkan_completion_watcher_drain_pending(
   return status;
 }
 
-// Releases a single completion entry: frees the resource set and releases the
-// semaphore.
+// The watcher whose mutex this thread holds while freeing resources. A release
+// path that re-enters iree_hal_vulkan_completion_watcher_release_completed on
+// the same thread returns immediately instead of deadlocking; the outer call
+// finishes the frees before its caller proceeds.
+static thread_local iree_hal_vulkan_completion_watcher_t*
+    iree_hal_vulkan_completion_watcher_releasing = NULL;
+
+// Unlinks |batch| from the in-flight list and frees its resources. The watcher
+// mutex must be held. No-op if the resources were already freed.
+static void iree_hal_vulkan_completion_batch_retire_locked(
+    iree_hal_vulkan_completion_watcher_t* watcher,
+    iree_hal_vulkan_completion_batch_t* batch) {
+  if (!batch->in_flight) return;
+  if (batch->prev) {
+    batch->prev->next = batch->next;
+  } else {
+    watcher->in_flight_head = batch->next;
+  }
+  if (batch->next) batch->next->prev = batch->prev;
+  batch->prev = NULL;
+  batch->next = NULL;
+  batch->in_flight = false;
+  iree_hal_resource_set_t* resource_set = batch->resource_set;
+  batch->resource_set = NULL;
+  iree_hal_vulkan_completion_watcher_t* outer =
+      iree_hal_vulkan_completion_watcher_releasing;
+  iree_hal_vulkan_completion_watcher_releasing = watcher;
+  iree_hal_resource_set_free(resource_set);
+  iree_hal_vulkan_completion_watcher_releasing = outer;
+}
+
+// Frees the resources of every in-flight submission. The watcher mutex must be
+// held.
+static void iree_hal_vulkan_completion_watcher_retire_all_locked(
+    iree_hal_vulkan_completion_watcher_t* watcher) {
+  while (watcher->in_flight_head) {
+    iree_hal_vulkan_completion_batch_retire_locked(watcher,
+                                                   watcher->in_flight_head);
+  }
+}
+
+// Releases a single completion entry: releases the semaphore and, with the
+// last entry of the submission, frees the batch. The submission resources are
+// normally freed already (when the submission was observed complete, or in
+// fail_all); if every entry was removed without the submission being observed
+// complete (its semaphores were failed by another thread), the last entry frees
+// them here, as before. |mutex_held| tells whether the caller holds the watcher
+// mutex.
 static void iree_hal_vulkan_completion_entry_release(
-    iree_hal_vulkan_completion_entry_t* entry) {
-  iree_hal_resource_set_free(entry->resource_set);
+    iree_hal_vulkan_completion_watcher_t* watcher,
+    iree_hal_vulkan_completion_entry_t* entry, bool mutex_held) {
+  iree_hal_vulkan_completion_batch_t* batch = entry->batch;
+  const bool is_last_entry = --batch->entry_count == 0;
+  if (is_last_entry) {
+    if (!mutex_held) iree_slim_mutex_lock(&watcher->mutex);
+    iree_hal_vulkan_completion_batch_retire_locked(watcher, batch);
+    if (!mutex_held) iree_slim_mutex_unlock(&watcher->mutex);
+  }
   iree_hal_semaphore_release(entry->semaphore);
+  if (is_last_entry) {
+    iree_allocator_free(watcher->host_allocator, batch);
+  }
   memset(entry, 0, sizeof(*entry));
 }
 
-// Swap-removes the entry at |index| from the active array.
+// Swap-removes the entry at |index| from the active array, together with the
+// value the scan observed for it (kept in the wait_values scratch array).
 static void iree_hal_vulkan_completion_watcher_swap_remove(
     iree_hal_vulkan_completion_watcher_t* watcher, iree_host_size_t index) {
   IREE_ASSERT(index < watcher->active_count);
@@ -181,6 +269,7 @@ static void iree_hal_vulkan_completion_watcher_swap_remove(
   if (index < watcher->active_count) {
     watcher->active_entries[index] =
         watcher->active_entries[watcher->active_count];
+    watcher->wait_values[index] = watcher->wait_values[watcher->active_count];
   }
 }
 
@@ -190,11 +279,18 @@ static void iree_hal_vulkan_completion_watcher_fail_all(
     iree_hal_vulkan_completion_watcher_t* watcher, iree_status_code_t code) {
   IREE_TRACE_ZONE_BEGIN(z0);
 
+  // As on completion, the submission resources are freed before a waiter can
+  // observe a (failed) semaphore.
+  iree_slim_mutex_lock(&watcher->mutex);
+  iree_hal_vulkan_completion_watcher_retire_all_locked(watcher);
+  iree_slim_mutex_unlock(&watcher->mutex);
+
   // Fail all active entries.
   for (iree_host_size_t i = 0; i < watcher->active_count; ++i) {
     iree_hal_semaphore_fail(watcher->active_entries[i].semaphore,
                             iree_status_from_code(code));
-    iree_hal_vulkan_completion_entry_release(&watcher->active_entries[i]);
+    iree_hal_vulkan_completion_entry_release(
+        watcher, &watcher->active_entries[i], /*mutex_held=*/false);
   }
   watcher->active_count = 0;
 
@@ -203,7 +299,8 @@ static void iree_hal_vulkan_completion_watcher_fail_all(
   for (iree_host_size_t i = 0; i < watcher->pending_count; ++i) {
     iree_hal_semaphore_fail(watcher->pending_entries[i].semaphore,
                             iree_status_from_code(code));
-    iree_hal_vulkan_completion_entry_release(&watcher->pending_entries[i]);
+    iree_hal_vulkan_completion_entry_release(
+        watcher, &watcher->pending_entries[i], /*mutex_held=*/true);
   }
   watcher->pending_count = 0;
   iree_slim_mutex_unlock(&watcher->mutex);
@@ -314,12 +411,36 @@ static int iree_hal_vulkan_completion_watcher_thread_main(void* param) {
     watcher->poke_last_value = (uint64_t)iree_atomic_load(
         &watcher->poke_next_value, iree_memory_order_acquire);
 
-    // Scan active entries for completion.
+    // Scan active entries for completion in three steps:
+    //   1. Observe every active entry's value.
+    //   2. If any entry completed, free the resources of every submission that
+    //      is complete by now (iree_hal_vulkan_completion_watcher_release_
+    //      completed) before signaling anything.
+    //   3. Sync host-side timelines and dispatch timepoints for the entries
+    //      observed complete in step 1.
+    //
+    // The order matters: a waiter woken by a dispatch (the host or another
+    // device's queue) may finish the program and tear down the VM context
+    // right away. A retained command buffer keeps its bindings alive, and a
+    // binding imported zero-copy from module rodata (hal.allocator.import)
+    // keeps the rodata iree_vm_buffer_t referenced, so iree_vm_buffer_
+    // deinitialize aborts when the module is destroyed. Step 2 frees not only
+    // the signaled submission's resources but those of every completed
+    // submission: a submission that the GPU finished earlier (and that the
+    // signaled one may have waited on) can still be waiting in the active set
+    // or in the pending list.
+    //
+    // NOTE(fork): upstream signals first and releases afterwards, here and in
+    // the rewritten driver on main (queue.c iree_hal_vulkan_queue_drain_
+    // completions: complete_submission before pending_submission_destroy).
+    // Moving to that code drops this fix and brings the teardown abort back
+    // unless it is re-applied.
     {
       IREE_TRACE_ZONE_BEGIN_NAMED(z_scan,
                                   "iree_hal_vulkan_completion_watcher_scan");
-      iree_host_size_t i = 0;
-      while (i < watcher->active_count) {
+      // Step 1. The wait arrays are free scratch space until the next wait.
+      bool any_completed = false;
+      for (iree_host_size_t i = 0; i < watcher->active_count; ++i) {
         uint64_t value = 0;
         VkResult query_result = syms->vkGetSemaphoreCounterValue(
             vk_device, watcher->active_entries[i].vk_semaphore, &value);
@@ -331,23 +452,40 @@ static int iree_hal_vulkan_completion_watcher_thread_main(void* param) {
           IREE_TRACE_ZONE_END(z_iteration);
           return 0;
         }
+        watcher->wait_values[i] = value;
+        if (value < IREE_HAL_SEMAPHORE_FAILURE_VALUE &&
+            value >= watcher->active_entries[i].target_value) {
+          any_completed = true;
+        }
+      }
 
+      // Step 2.
+      if (any_completed) {
+        iree_hal_vulkan_completion_watcher_release_completed(watcher);
+      }
+
+      // Step 3.
+      iree_host_size_t i = 0;
+      while (i < watcher->active_count) {
+        uint64_t value = watcher->wait_values[i];
         if (value >= IREE_HAL_SEMAPHORE_FAILURE_VALUE) {
           // Semaphore has been failed by another thread. The failing thread
-          // already dispatched timepoints, so we just free resources.
-          iree_hal_vulkan_completion_entry_release(&watcher->active_entries[i]);
+          // already dispatched timepoints, so we just release the entry.
+          iree_hal_vulkan_completion_entry_release(
+              watcher, &watcher->active_entries[i], /*mutex_held=*/false);
           iree_hal_vulkan_completion_watcher_swap_remove(watcher, i);
           continue;
         }
 
         if (value >= watcher->active_entries[i].target_value) {
-          // Completed. Sync host-side async timeline and dispatch timepoints.
+          // Completed; its resources were freed in step 2.
           iree_async_semaphore_t* async_sem =
               (iree_async_semaphore_t*)watcher->active_entries[i].semaphore;
           iree_atomic_store(&async_sem->timeline_value, (int64_t)value,
                             iree_memory_order_release);
           iree_async_semaphore_dispatch_timepoints(async_sem, value);
-          iree_hal_vulkan_completion_entry_release(&watcher->active_entries[i]);
+          iree_hal_vulkan_completion_entry_release(
+              watcher, &watcher->active_entries[i], /*mutex_held=*/false);
           iree_hal_vulkan_completion_watcher_swap_remove(watcher, i);
           continue;
         }
@@ -380,6 +518,7 @@ iree_status_t iree_hal_vulkan_completion_watcher_create(
       z0, iree_allocator_malloc(host_allocator, sizeof(*watcher),
                                 (void**)&watcher));
   memset(watcher, 0, sizeof(*watcher));
+  iree_atomic_ref_count_init(&watcher->ref_count);
   watcher->host_allocator = host_allocator;
   watcher->logical_device = logical_device;
   iree_atomic_store(&watcher->poke_next_value, 0, iree_memory_order_release);
@@ -481,15 +620,68 @@ void iree_hal_vulkan_completion_watcher_destroy(
       *watcher->logical_device, watcher->poke_semaphore,
       watcher->logical_device->allocator());
 
+  // Free the resources of any submission still in flight. Normally there are
+  // none: the thread exits only after every active entry was processed.
+  iree_slim_mutex_lock(&watcher->mutex);
+  iree_hal_vulkan_completion_watcher_retire_all_locked(watcher);
+  iree_slim_mutex_unlock(&watcher->mutex);
+
   // Free arrays. active_entries is the base of the combined allocation that
   // also contains wait_semaphores and wait_values.
   iree_allocator_free(watcher->host_allocator, watcher->pending_entries);
+  watcher->pending_entries = NULL;
+  watcher->pending_count = 0;
   iree_allocator_free(watcher->host_allocator, watcher->active_entries);
-  iree_slim_mutex_deinitialize(&watcher->mutex);
+  watcher->active_entries = NULL;
+  watcher->active_count = 0;
 
+  // Drop the device's reference. Semaphores still alive keep the (now empty)
+  // watcher until they are destroyed.
+  iree_hal_vulkan_completion_watcher_release(watcher);
+
+  IREE_TRACE_ZONE_END(z0);
+}
+
+void iree_hal_vulkan_completion_watcher_retain(
+    iree_hal_vulkan_completion_watcher_t* watcher) {
+  if (watcher) iree_atomic_ref_count_inc(&watcher->ref_count);
+}
+
+void iree_hal_vulkan_completion_watcher_release(
+    iree_hal_vulkan_completion_watcher_t* watcher) {
+  if (!watcher || iree_atomic_ref_count_dec(&watcher->ref_count) != 1) return;
+  iree_slim_mutex_deinitialize(&watcher->mutex);
   iree_allocator_t host_allocator = watcher->host_allocator;
   iree_allocator_free(host_allocator, watcher);
+}
 
+void iree_hal_vulkan_completion_watcher_release_completed(
+    iree_hal_vulkan_completion_watcher_t* watcher) {
+  if (!watcher) return;
+  // Re-entered from a release path on this thread: the outer call is freeing
+  // under the mutex and finishes before its caller proceeds.
+  if (iree_hal_vulkan_completion_watcher_releasing == watcher) return;
+  IREE_TRACE_ZONE_BEGIN(z0);
+  iree_slim_mutex_lock(&watcher->mutex);
+  iree_hal_vulkan_completion_batch_t* batch = watcher->in_flight_head;
+  // Nothing in flight (also after the device shut the watcher down): do not
+  // touch the device.
+  auto* syms = batch ? watcher->logical_device->syms().get() : nullptr;
+  VkDevice vk_device = batch ? (VkDevice)*watcher->logical_device : VK_NULL_HANDLE;
+  while (batch) {
+    iree_hal_vulkan_completion_batch_t* next_batch = batch->next;
+    uint64_t value = 0;
+    VkResult result =
+        syms->vkGetSemaphoreCounterValue(vk_device, batch->vk_semaphore, &value);
+    // A failed semaphore does not mean the GPU work finished; leave those to
+    // the failure paths.
+    if (result == VK_SUCCESS && value < IREE_HAL_SEMAPHORE_FAILURE_VALUE &&
+        value >= batch->target_value) {
+      iree_hal_vulkan_completion_batch_retire_locked(watcher, batch);
+    }
+    batch = next_batch;
+  }
+  iree_slim_mutex_unlock(&watcher->mutex);
   IREE_TRACE_ZONE_END(z0);
 }
 
@@ -506,11 +698,32 @@ iree_status_t iree_hal_vulkan_completion_watcher_register(
   }
   IREE_TRACE_ZONE_BEGIN(z0);
 
+  // All entries of this submission share one batch that holds its resources,
+  // so whichever of its semaphores is observed complete first frees them
+  // before any of them is signaled.
+  iree_hal_vulkan_completion_batch_t* batch = NULL;
+  iree_status_t batch_status = iree_allocator_malloc(
+      watcher->host_allocator, sizeof(*batch), (void**)&batch);
+  if (!iree_status_is_ok(batch_status)) {
+    iree_hal_resource_set_free(resource_set);
+    IREE_TRACE_ZONE_END(z0);
+    return batch_status;
+  }
+  batch->resource_set = resource_set;
+  batch->vk_semaphore =
+      iree_hal_vulkan_native_semaphore_handle(signal_semaphores->semaphores[0]);
+  batch->target_value = signal_semaphores->payload_values[0];
+  batch->prev = NULL;
+  batch->next = NULL;
+  batch->in_flight = false;
+  batch->entry_count = signal_semaphores->count;
+
   iree_slim_mutex_lock(&watcher->mutex);
 
   // Check for failure/exit before accepting new work.
   if (watcher->do_exit) {
     iree_slim_mutex_unlock(&watcher->mutex);
+    iree_allocator_free(watcher->host_allocator, batch);
     iree_hal_resource_set_free(resource_set);
     IREE_TRACE_ZONE_END(z0);
     return iree_make_status(IREE_STATUS_ABORTED,
@@ -529,6 +742,7 @@ iree_status_t iree_hal_vulkan_completion_watcher_register(
         (void**)&new_pending);
     if (!iree_status_is_ok(status)) {
       iree_slim_mutex_unlock(&watcher->mutex);
+      iree_allocator_free(watcher->host_allocator, batch);
       iree_hal_resource_set_free(resource_set);
       IREE_TRACE_ZONE_END(z0);
       return status;
@@ -543,7 +757,7 @@ iree_status_t iree_hal_vulkan_completion_watcher_register(
     watcher->pending_capacity = new_capacity;
   }
 
-  // Append entries. The resource set attaches to the last entry.
+  // Append entries. They all share the batch holding the resource set.
   for (iree_host_size_t i = 0; i < signal_semaphores->count; ++i) {
     iree_hal_vulkan_completion_entry_t* entry =
         &watcher->pending_entries[watcher->pending_count++];
@@ -552,8 +766,15 @@ iree_status_t iree_hal_vulkan_completion_watcher_register(
     entry->vk_semaphore =
         iree_hal_vulkan_native_semaphore_handle(entry->semaphore);
     entry->target_value = signal_semaphores->payload_values[i];
-    entry->resource_set =
-        (i == signal_semaphores->count - 1) ? resource_set : NULL;
+    entry->batch = batch;
+  }
+
+  // Track the submission's resources until it is observed complete.
+  if (resource_set) {
+    batch->next = watcher->in_flight_head;
+    if (batch->next) batch->next->prev = batch;
+    watcher->in_flight_head = batch;
+    batch->in_flight = true;
   }
 
   iree_slim_mutex_unlock(&watcher->mutex);

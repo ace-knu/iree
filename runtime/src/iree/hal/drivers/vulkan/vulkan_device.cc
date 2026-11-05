@@ -871,6 +871,16 @@ static iree_status_t iree_hal_vulkan_device_create_internal(
         device->logical_device, host_allocator, &device->completion_watcher);
   }
 
+  // Queues free completed submissions' resources through the watcher before
+  // they signal other devices' semaphores from the host. All queues are
+  // DirectCommandQueues (iree_hal_vulkan_device_create_queue).
+  if (iree_status_is_ok(status)) {
+    for (iree_host_size_t i = 0; i < device->queue_count; ++i) {
+      static_cast<DirectCommandQueue*>(device->queues[i])
+          ->set_completion_watcher(device->completion_watcher);
+    }
+  }
+
   if (iree_status_is_ok(status)) {
     *out_device = (iree_hal_device_t*)device;
   } else {
@@ -1774,7 +1784,8 @@ static iree_status_t iree_hal_vulkan_device_create_semaphore(
     iree_hal_semaphore_t** out_semaphore) {
   iree_hal_vulkan_device_t* device = iree_hal_vulkan_device_cast(base_device);
   return iree_hal_vulkan_native_semaphore_create(
-      device->logical_device, device->proactor, initial_value, out_semaphore);
+      device->logical_device, device->proactor, device->completion_watcher,
+      initial_value, out_semaphore);
 }
 
 static iree_hal_semaphore_compatibility_t
@@ -1987,6 +1998,9 @@ static iree_status_t iree_hal_vulkan_device_issue_execute(
     if (iree_status_is_ok(status)) {
       status = iree_hal_vulkan_completion_watcher_register(
           device->completion_watcher, &native_signal_list, resource_set);
+      // The watcher owns the resource set from here on, also when registration
+      // failed (it frees the set on its failure paths). Do not free it again.
+      resource_set = NULL;
     }
     if (!iree_status_is_ok(status)) {
       iree_hal_resource_set_free(resource_set);
