@@ -166,6 +166,15 @@ iree_status_t DirectCommandQueue::Submit(
     syms()->vkDestroyFence(*logical_device_, fence,
                            logical_device_->allocator());
     if (iree_status_is_ok(status)) {
+      // The signals below make this submission's completion visible to other
+      // devices and to the host without going through the completion watcher.
+      // The GPU work this submission waited on has completed too, and its
+      // resources may still be retained by the watcher. Free the resources of
+      // every completed submission first, as the watcher does before it
+      // signals: a waiter may finish the program and tear down the VM context
+      // right away, and a retained binding imported from module rodata would
+      // make iree_vm_buffer_deinitialize abort.
+      iree_hal_vulkan_completion_watcher_release_completed(completion_watcher_);
       for (iree_host_size_t b = 0; b < batch_count; ++b) {
         const iree_hal_semaphore_list_t& signals = batches[b].signal_semaphores;
         for (iree_host_size_t i = 0; i < signals.count; ++i) {

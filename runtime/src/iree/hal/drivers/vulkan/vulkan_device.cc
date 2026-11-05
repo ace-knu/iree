@@ -871,6 +871,16 @@ static iree_status_t iree_hal_vulkan_device_create_internal(
         device->logical_device, host_allocator, &device->completion_watcher);
   }
 
+  // Queues free completed submissions' resources through the watcher before
+  // they signal other devices' semaphores from the host. All queues are
+  // DirectCommandQueues (iree_hal_vulkan_device_create_queue).
+  if (iree_status_is_ok(status)) {
+    for (iree_host_size_t i = 0; i < device->queue_count; ++i) {
+      static_cast<DirectCommandQueue*>(device->queues[i])
+          ->set_completion_watcher(device->completion_watcher);
+    }
+  }
+
   if (iree_status_is_ok(status)) {
     *out_device = (iree_hal_device_t*)device;
   } else {

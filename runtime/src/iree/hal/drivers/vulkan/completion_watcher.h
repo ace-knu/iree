@@ -41,10 +41,11 @@ void iree_hal_vulkan_completion_watcher_destroy(
 // completion, synchronize the host-side async timeline and dispatch timepoints.
 //
 // Ownership of |resource_set| transfers to the watcher, also when registration
-// fails. It is freed when the first semaphore in the list is observed at its
-// target value, before any semaphore of the list is signaled, so a waiter that
-// wakes up never sees the submission's resources still retained. If
-// |resource_set| is NULL, no resources are freed on completion.
+// fails. It is freed by the first iree_hal_vulkan_completion_watcher_release_
+// completed call that observes the submission complete, which the watcher makes
+// before it signals any semaphore, so a waiter that wakes up never sees the
+// submission's resources still retained. If |resource_set| is NULL, no
+// resources are freed on completion.
 //
 // Thread-safe. Non-blocking. Wakes the watcher thread to include the new
 // semaphores in its next wait set.
@@ -52,6 +53,22 @@ iree_status_t iree_hal_vulkan_completion_watcher_register(
     iree_hal_vulkan_completion_watcher_t* watcher,
     const iree_hal_semaphore_list_t* signal_semaphores,
     iree_hal_resource_set_t* resource_set);
+
+// Frees the resources of every registered submission that has completed on the
+// GPU. Rule: when a completion becomes visible (a semaphore is signaled or a
+// waiter is woken), the resources of every submission completed by then are
+// already released. The watcher calls this before it signals; a caller that
+// learns of a completion without going through the watcher (for example a host
+// fence wait before signaling other devices' semaphores) calls it before it
+// makes that completion visible.
+//
+// Thread-safe. Does not wait on the GPU or on the watcher thread: it takes the
+// watcher mutex, queries each in-flight submission once, and frees the
+// completed ones under the mutex, so on return every submission that was
+// complete when the call began has been released. A call re-entered from a
+// release path on the same thread returns immediately. |watcher| may be NULL.
+void iree_hal_vulkan_completion_watcher_release_completed(
+    iree_hal_vulkan_completion_watcher_t* watcher);
 
 #ifdef __cplusplus
 }  // extern "C"
