@@ -1963,6 +1963,9 @@ static iree_status_t iree_hal_vulkan_device_queue_execute(
     if (iree_status_is_ok(status)) {
       status = iree_hal_vulkan_completion_watcher_register(
           device->completion_watcher, &native_signal_list, resource_set);
+      // The watcher owns the resource set from here on, also when registration
+      // failed (it frees the set on its failure paths). Do not free it again.
+      resource_set = NULL;
     }
     if (!iree_status_is_ok(status)) {
       iree_hal_resource_set_free(resource_set);
