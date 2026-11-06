@@ -144,6 +144,33 @@ static void iree_hal_vulkan_native_semaphore_release_before_visible(
   }
 }
 
+// Every value read from Vulkan (a query, a wait, the completion watcher) only
+// moves the host-side timeline forward; the thread that moves it dispatches.
+// Waiter registration (iree_async_semaphore_acquire_timepoint) re-checks the
+// timeline after inserting and dispatch is edge-triggered, which is only
+// correct if the timeline never decreases.
+//
+// NOTE(fork): upstream (#23695) stored the observed value unconditionally in
+// the query, the wait and the completion watcher. A thread that read an older
+// value from Vulkan could then lower the timeline after another thread had
+// raised it and dispatched, and a timepoint registered afterwards never fired
+// (for example a CPU queue operation waiting on a Vulkan fence, so the host
+// waits that depend on it hung). Same rule as upstream main's rewritten driver
+// (semaphore.c iree_hal_vulkan_semaphore_observe_native_value, 9e2ac9142e).
+uint64_t iree_hal_vulkan_native_semaphore_observe_value(
+    iree_async_semaphore_t* semaphore, uint64_t value) {
+  int64_t current_raw = 0;
+  do {
+    current_raw =
+        iree_atomic_load(&semaphore->timeline_value, iree_memory_order_acquire);
+    if (value <= (uint64_t)current_raw) return (uint64_t)current_raw;
+  } while (!iree_atomic_compare_exchange_weak(
+      &semaphore->timeline_value, &current_raw, (int64_t)value,
+      iree_memory_order_release, iree_memory_order_relaxed));
+  iree_async_semaphore_dispatch_timepoints(semaphore, value);
+  return value;
+}
+
 static uint64_t iree_hal_vulkan_native_semaphore_query(
     iree_async_semaphore_t* base_semaphore) {
   iree_hal_vulkan_native_semaphore_t* semaphore =
@@ -182,16 +209,12 @@ static uint64_t iree_hal_vulkan_native_semaphore_query(
 
   iree_hal_vulkan_native_semaphore_release_before_visible(semaphore, value);
 
-  // Sync the timeline to the Vulkan-queried value. We use an atomic store
-  // rather than the normal signal path because queries can return the same
-  // value on consecutive calls, which is not a monotonicity violation. This
-  // flushes any satisfied timepoints, keeping latency low on the device-side
-  // signal path (Vulkan does not notify us of device-side signals).
-  iree_atomic_store(&async_sem->timeline_value, (int64_t)value,
-                    iree_memory_order_release);
-  iree_async_semaphore_dispatch_timepoints(base_semaphore, value);
-
-  return value;
+  // Raise the host-side timeline to the Vulkan value (never lower it) and
+  // dispatch the timepoints it satisfies. This keeps latency low on the
+  // device-side signal path (Vulkan does not notify us of device-side
+  // signals). Returns the host-side value, which another thread may already
+  // have raised past what we read.
+  return iree_hal_vulkan_native_semaphore_observe_value(base_semaphore, value);
 }
 
 static iree_status_t iree_hal_vulkan_native_semaphore_signal(
@@ -200,6 +223,21 @@ static iree_status_t iree_hal_vulkan_native_semaphore_signal(
   iree_hal_vulkan_native_semaphore_t* semaphore =
       iree_hal_vulkan_native_semaphore_cast(
           iree_hal_semaphore_cast(base_semaphore));
+
+  // Advance the software timeline (CAS) and merge frontier first, then the
+  // VkSemaphore. Each timeline value must be signaled exactly once — CAS
+  // failure here indicates a structural error (duplicate signal or
+  // non-monotonic scheduling). Observers (query, wait, completion watcher)
+  // only raise the host-side timeline to values they read from Vulkan, so
+  // with this order none of them can get ahead of this signal and make the
+  // CAS fail.
+  //
+  // NOTE(fork): upstream (#23695) signaled the VkSemaphore first, leaving a
+  // window in which an observer could publish |new_value| before the CAS here.
+  // Same order as upstream main's rewritten driver (semaphore.c
+  // iree_hal_vulkan_semaphore_signal, 9e2ac9142e).
+  IREE_RETURN_IF_ERROR(iree_async_semaphore_advance_timeline(
+      base_semaphore, new_value, frontier));
 
   VkSemaphoreSignalInfo signal_info;
   signal_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO;
@@ -210,28 +248,15 @@ static iree_status_t iree_hal_vulkan_native_semaphore_signal(
       VK_RESULT_TO_STATUS(semaphore->logical_device->syms()->vkSignalSemaphore(
                               *semaphore->logical_device, &signal_info),
                           "vkSignalSemaphore");
-
-  if (iree_status_is_ok(status)) {
-    // Advance the software timeline (CAS) and merge frontier. Each timeline
-    // value must be signaled exactly once — CAS failure here indicates a
-    // structural error (duplicate signal or non-monotonic scheduling).
-    iree_status_t advance_status = iree_async_semaphore_advance_timeline(
-        base_semaphore, new_value, frontier);
-    if (IREE_UNLIKELY(!iree_status_is_ok(advance_status))) {
-      iree_async_semaphore_fail(base_semaphore, advance_status);
-      // The VkSemaphore was already signaled — return OK for the Vulkan side
-      // but the async semaphore is now failed so waiters get the diagnostic.
-      return iree_ok_status();
-    }
-    iree_async_semaphore_dispatch_timepoints(base_semaphore, new_value);
-  } else {
+  if (!iree_status_is_ok(status)) {
     // Vulkan signal failed — fail the async semaphore to notify waiters.
-    // iree_async_semaphore_fail takes ownership of the status.
-    iree_async_semaphore_fail(base_semaphore,
-                              iree_status_from_code(iree_status_code(status)));
+    // iree_async_semaphore_fail takes ownership of the clone.
+    iree_async_semaphore_fail(base_semaphore, iree_status_clone(status));
+    return status;
   }
 
-  return status;
+  iree_async_semaphore_dispatch_timepoints(base_semaphore, new_value);
+  return iree_ok_status();
 }
 
 static void iree_hal_vulkan_native_semaphore_on_fail(
@@ -306,15 +331,14 @@ static iree_status_t iree_hal_vulkan_native_semaphore_wait(
 
     // Sync the async timeline so timepoints waiting on this value dispatch
     // immediately rather than waiting for the completion watcher's next pass.
+    // Only raises it (see iree_hal_vulkan_native_semaphore_observe_value).
     uint64_t current_value = 0;
     VkResult query_result =
         semaphore->logical_device->syms()->vkGetSemaphoreCounterValue(
             *semaphore->logical_device, semaphore->handle, &current_value);
     if (query_result == VK_SUCCESS &&
         current_value < IREE_HAL_SEMAPHORE_FAILURE_VALUE) {
-      iree_atomic_store(&async_sem->timeline_value, (int64_t)current_value,
-                        iree_memory_order_release);
-      iree_async_semaphore_dispatch_timepoints(async_sem, current_value);
+      iree_hal_vulkan_native_semaphore_observe_value(async_sem, current_value);
     }
   }
 

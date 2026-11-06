@@ -478,12 +478,13 @@ static int iree_hal_vulkan_completion_watcher_thread_main(void* param) {
         }
 
         if (value >= watcher->active_entries[i].target_value) {
-          // Completed; its resources were freed in step 2.
-          iree_async_semaphore_t* async_sem =
-              (iree_async_semaphore_t*)watcher->active_entries[i].semaphore;
-          iree_atomic_store(&async_sem->timeline_value, (int64_t)value,
-                            iree_memory_order_release);
-          iree_async_semaphore_dispatch_timepoints(async_sem, value);
+          // Completed; its resources were freed in step 2. Publish the value
+          // only forward: a query or wait on another thread may already have
+          // published it or a later one (see
+          // iree_hal_vulkan_native_semaphore_observe_value).
+          iree_hal_vulkan_native_semaphore_observe_value(
+              (iree_async_semaphore_t*)watcher->active_entries[i].semaphore,
+              value);
           iree_hal_vulkan_completion_entry_release(
               watcher, &watcher->active_entries[i], /*mutex_held=*/false);
           iree_hal_vulkan_completion_watcher_swap_remove(watcher, i);

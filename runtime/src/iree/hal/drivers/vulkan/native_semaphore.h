@@ -40,6 +40,14 @@ bool iree_hal_vulkan_native_semaphore_isa(iree_hal_semaphore_t* semaphore);
 VkSemaphore iree_hal_vulkan_native_semaphore_handle(
     iree_hal_semaphore_t* semaphore);
 
+// Raises the host-side timeline of the Vulkan semaphore |semaphore| to |value|,
+// a value read from Vulkan, if it is higher, and dispatches the timepoints it
+// satisfies. A lower or equal |value| (a stale observation, or one another
+// thread already published) changes nothing. |value| must not be a failure
+// value. Returns the host-side value after the call.
+uint64_t iree_hal_vulkan_native_semaphore_observe_value(
+    iree_async_semaphore_t* semaphore, uint64_t value);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus
