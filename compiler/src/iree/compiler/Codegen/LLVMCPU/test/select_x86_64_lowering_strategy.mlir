@@ -3,6 +3,8 @@
 // generalizing the named ops. This ensures convolution pipeline selection works
 // on both named and generic convs.
 // RUN: iree-opt --pass-pipeline='builtin.module(func.func(linalg-generalize-named-ops),iree-llvmcpu-select-lowering-strategy)' --split-input-file %s | FileCheck %s --check-prefix=GENERIC
+// Partial (masked) matmul vector tiles disabled: the previous divisor-only rule.
+// RUN: iree-opt --iree-llvmcpu-matmul-partial-vector-tile-max-waste=0 --pass-pipeline='builtin.module(iree-llvmcpu-select-lowering-strategy)' --split-input-file %s | FileCheck %s --check-prefix=OFF
 
 #map = affine_map<(d0, d1) -> (d0, d1)>
 #map1 = affine_map<(d0, d1) -> (d1)>
@@ -169,7 +171,11 @@ func.func @matmul_partially_peel(%3: tensor<16641x16xf32>, %4: tensor<16x8xf32>)
   %7 = linalg.matmul ins(%3, %4 : tensor<16641x16xf32>, tensor<16x8xf32>) outs(%6 : tensor<16641x8xf32>) -> tensor<16641x8xf32>
   return %7 : tensor<16641x8xf32>
 }
-//  CHECK-DAG: #[[CONFIG:.+]] = #iree_cpu.lowering_config<distribution = [43, 8, 0], vector_common_parallel = [3, 8, 0], vector_reduction = [0, 0, 16]>
+// M = 16641 = 129 * 129: the largest divisor <= 8 is 3; with masking an 8-row
+// vector tile wastes 5 rows per 43-row distribution tile (11.6%), within the
+// default 12.5% bound.
+//  CHECK-DAG: #[[CONFIG:.+]] = #iree_cpu.lowering_config<distribution = [43, 8, 0], vector_common_parallel = [8, 8, 0], vector_reduction = [0, 0, 16]>
+//    OFF-DAG: #iree_cpu.lowering_config<distribution = [43, 8, 0], vector_common_parallel = [3, 8, 0], vector_reduction = [0, 0, 16]>
 //  CHECK-DAG: #[[TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = #iree_cpu.pipeline<DoubleTilingExpert>>
 //      CHECK: func.func @matmul_partially_peel(
 // CHECK-SAME:     translation_info = #[[TRANSLATION]]
@@ -517,7 +523,10 @@ func.func @matmul_odd(%4: tensor<33x16xf32>, %5: tensor<16x49xf32>, %6: tensor<3
   %9 = linalg.matmul ins(%4, %5 : tensor<33x16xf32>, tensor<16x49xf32>) outs(%8 : tensor<33x49xf32>) -> tensor<33x49xf32>
   return %9 : tensor<33x49xf32>
 }
-//  CHECK-DAG: #[[CONFIG:.+]] = #iree_cpu.lowering_config<distribution = [8, 49, 0], vector_common_parallel = [3, 7, 0], vector_reduction = [0, 0, 16]>
+// M = 33: the largest divisor <= 8 is 3; with masking a 4-row vector tile
+// wastes 3 rows (9%), within the default 12.5% bound.
+//  CHECK-DAG: #[[CONFIG:.+]] = #iree_cpu.lowering_config<distribution = [8, 49, 0], vector_common_parallel = [4, 7, 0], vector_reduction = [0, 0, 16]>
+//    OFF-DAG: #iree_cpu.lowering_config<distribution = [8, 49, 0], vector_common_parallel = [3, 7, 0], vector_reduction = [0, 0, 16]>
 //  CHECK-DAG: #[[TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = #iree_cpu.pipeline<DoubleTilingExpert>>
 //      CHECK: func.func @matmul_odd(
 // CHECK-SAME:       translation_info = #[[TRANSLATION]]
@@ -1705,3 +1714,86 @@ func.func @inner_tiled_avx512_1x16x1_f32(%lhs: tensor<2x4x2x1xf32>, %rhs: tensor
 //  CHECK-SAME:     translation_info = #[[INNER_TILED_TRANSLATION]]
 //       CHECK:   iree_codegen.inner_tiled
 //  CHECK-SAME:       lowering_config = #[[INNER_TILED_CONFIG]]
+
+// -----
+
+// Partial (masked) matmul vector tiles (research/inception-opt):
+// M = 289 = 17 * 17 (im2col matmul of a 17x17 convolution) has no divisor
+// in 2..8, so the divisor-only rule gives a 1-row vector tile. With masking,
+// an 8-row tile wastes 7 rows in total (2.4%).
+#executable_target_system_elf_x86_64_ = #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu_features = "+avx512f", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128", native_vector_size = 16 : index, target_triple = "x86_64-unknown-linux-gnu"}>
+func.func @matmul_partial_vector_289x160x768(%3: tensor<289x768xf32>, %4: tensor<768x160xf32>) -> tensor<289x160xf32> attributes {hal.executable.target = #executable_target_system_elf_x86_64_} {
+  %cst = arith.constant 0.000000e+00 : f32
+  %5 = tensor.empty() : tensor<289x160xf32>
+  %6 = linalg.fill ins(%cst : f32) outs(%5 : tensor<289x160xf32>) -> tensor<289x160xf32>
+  %7 = linalg.matmul ins(%3, %4 : tensor<289x768xf32>, tensor<768x160xf32>) outs(%6 : tensor<289x160xf32>) -> tensor<289x160xf32>
+  return %7 : tensor<289x160xf32>
+}
+//  CHECK-DAG: #[[CONFIG:.+]] = #iree_cpu.lowering_config<distribution = [64, 40, 0], vector_common_parallel = [8, 16, 0], vector_reduction = [0, 0, 16]>
+//      CHECK: func.func @matmul_partial_vector_289x160x768(
+//      CHECK:   linalg.matmul
+// CHECK-SAME:       lowering_config = #[[CONFIG]]
+//    OFF-DAG: #[[OFF_CONFIG:.+]] = #iree_cpu.lowering_config<distribution = [64, 40, 0], vector_common_parallel = [1, 16, 0], vector_reduction = [0, 0, 16]>
+//        OFF: func.func @matmul_partial_vector_289x160x768(
+//        OFF:   linalg.matmul
+//   OFF-SAME:       lowering_config = #[[OFF_CONFIG]]
+
+// -----
+
+// M = 5041 = 71 * 71: 8 rows, 7 masked rows in total.
+#executable_target_system_elf_x86_64_ = #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu_features = "+avx512f", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128", native_vector_size = 16 : index, target_triple = "x86_64-unknown-linux-gnu"}>
+func.func @matmul_partial_vector_5041x192x720(%3: tensor<5041x720xf32>, %4: tensor<720x192xf32>) -> tensor<5041x192xf32> attributes {hal.executable.target = #executable_target_system_elf_x86_64_} {
+  %cst = arith.constant 0.000000e+00 : f32
+  %5 = tensor.empty() : tensor<5041x192xf32>
+  %6 = linalg.fill ins(%cst : f32) outs(%5 : tensor<5041x192xf32>) -> tensor<5041x192xf32>
+  %7 = linalg.matmul ins(%3, %4 : tensor<5041x720xf32>, tensor<720x192xf32>) outs(%6 : tensor<5041x192xf32>) -> tensor<5041x192xf32>
+  return %7 : tensor<5041x192xf32>
+}
+//  CHECK-DAG: #[[CONFIG:.+]] = #iree_cpu.lowering_config<distribution = [64, 64, 0], vector_common_parallel = [8, 16, 0], vector_reduction = [0, 0, 16]>
+//      CHECK: func.func @matmul_partial_vector_5041x192x720(
+//      CHECK:   linalg.matmul
+// CHECK-SAME:       lowering_config = #[[CONFIG]]
+//    OFF-DAG: #[[OFF_CONFIG:.+]] = #iree_cpu.lowering_config<distribution = [64, 64, 0], vector_common_parallel = [1, 16, 0], vector_reduction = [0, 0, 16]>
+//        OFF: func.func @matmul_partial_vector_5041x192x720(
+//        OFF:   linalg.matmul
+//   OFF-SAME:       lowering_config = #[[OFF_CONFIG]]
+
+// -----
+
+// M = 1225 = 35 * 35: the divisor 7 is more than half of 8, so it is kept.
+#executable_target_system_elf_x86_64_ = #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu_features = "+avx512f", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128", native_vector_size = 16 : index, target_triple = "x86_64-unknown-linux-gnu"}>
+func.func @matmul_partial_vector_1225x96x576(%3: tensor<1225x576xf32>, %4: tensor<576x96xf32>) -> tensor<1225x96xf32> attributes {hal.executable.target = #executable_target_system_elf_x86_64_} {
+  %cst = arith.constant 0.000000e+00 : f32
+  %5 = tensor.empty() : tensor<1225x96xf32>
+  %6 = linalg.fill ins(%cst : f32) outs(%5 : tensor<1225x96xf32>) -> tensor<1225x96xf32>
+  %7 = linalg.matmul ins(%3, %4 : tensor<1225x576xf32>, tensor<576x96xf32>) outs(%6 : tensor<1225x96xf32>) -> tensor<1225x96xf32>
+  return %7 : tensor<1225x96xf32>
+}
+//  CHECK-DAG: #[[CONFIG:.+]] = #iree_cpu.lowering_config<distribution = [49, 48, 0], vector_common_parallel = [7, 16, 0], vector_reduction = [0, 0, 16]>
+//      CHECK: func.func @matmul_partial_vector_1225x96x576(
+//      CHECK:   linalg.matmul
+// CHECK-SAME:       lowering_config = #[[CONFIG]]
+//    OFF-DAG: #[[OFF_CONFIG:.+]] = #iree_cpu.lowering_config<distribution = [49, 48, 0], vector_common_parallel = [7, 16, 0], vector_reduction = [0, 0, 16]>
+//        OFF: func.func @matmul_partial_vector_1225x96x576(
+//        OFF:   linalg.matmul
+//   OFF-SAME:       lowering_config = #[[OFF_CONFIG]]
+
+// -----
+
+// M = 49: the divisor 7 is kept.
+#executable_target_system_elf_x86_64_ = #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu_features = "+avx512f", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128", native_vector_size = 16 : index, target_triple = "x86_64-unknown-linux-gnu"}>
+func.func @matmul_partial_vector_49x64x576(%3: tensor<49x576xf32>, %4: tensor<576x64xf32>) -> tensor<49x64xf32> attributes {hal.executable.target = #executable_target_system_elf_x86_64_} {
+  %cst = arith.constant 0.000000e+00 : f32
+  %5 = tensor.empty() : tensor<49x64xf32>
+  %6 = linalg.fill ins(%cst : f32) outs(%5 : tensor<49x64xf32>) -> tensor<49x64xf32>
+  %7 = linalg.matmul ins(%3, %4 : tensor<49x576xf32>, tensor<576x64xf32>) outs(%6 : tensor<49x64xf32>) -> tensor<49x64xf32>
+  return %7 : tensor<49x64xf32>
+}
+//  CHECK-DAG: #[[CONFIG:.+]] = #iree_cpu.lowering_config<distribution = [7, 64, 0], vector_common_parallel = [7, 16, 0], vector_reduction = [0, 0, 16]>
+//      CHECK: func.func @matmul_partial_vector_49x64x576(
+//      CHECK:   linalg.matmul
+// CHECK-SAME:       lowering_config = #[[CONFIG]]
+//    OFF-DAG: #[[OFF_CONFIG:.+]] = #iree_cpu.lowering_config<distribution = [7, 64, 0], vector_common_parallel = [7, 16, 0], vector_reduction = [0, 0, 16]>
+//        OFF: func.func @matmul_partial_vector_49x64x576(
+//        OFF:   linalg.matmul
+//   OFF-SAME:       lowering_config = #[[OFF_CONFIG]]

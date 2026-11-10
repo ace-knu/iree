@@ -87,6 +87,19 @@ static llvm::cl::opt<int>
                           llvm::cl::desc("default distribution tile size"),
                           llvm::cl::init(64));
 
+// research/inception-opt: with the masking vector strategy, a matmul vector
+// tile does not have to divide the dimension. 0 disables it (previous
+// behavior).
+static llvm::cl::opt<double> clMatmulPartialVectorTileMaxWaste(
+    "iree-llvmcpu-matmul-partial-vector-tile-max-waste",
+    llvm::cl::desc(
+        "Maximum masked waste (fraction of the dimension) allowed when a "
+        "matmul vector tile does not divide its parallel dimension. Used only "
+        "with the masking vector strategy, when the largest dividing tile is "
+        "at most half of the target vector tile; 0 disables partial vector "
+        "tiles"),
+    llvm::cl::init(0.125));
+
 static llvm::cl::opt<int> clMatmulTileBytes(
     "iree-llvmcpu-matmul-tile-bytes",
     llvm::cl::desc(
@@ -695,6 +708,44 @@ static int64_t getMaxVectorTileSize(int64_t numElem, int64_t tileSize,
   return 1;
 }
 
+/// Returns the largest vector tile size in (`divisibleTileSize`, `tileSize`]
+/// for a dimension of `numElem` elements distributed with `distTileSize` such
+/// that the elements masked off in partial vector tiles stay within
+/// `maxWaste * numElem`, or `divisibleTileSize` if there is none. The waste is
+/// counted per distribution tile, as the vector tiling runs inside each one.
+/// When the target tile spans vector lanes (`tileSize >= vectorSize`), only
+/// multiples of `vectorSize` are considered. This is meant for dimensions
+/// without small factors, e.g. M = OH * OW of convolutions with odd spatial
+/// sizes (17x17 = 289), for which the largest dividing tile is 1.
+static int64_t getPartialVectorTileSize(int64_t numElem, int64_t distTileSize,
+                                        int64_t tileSize, int64_t vectorSize,
+                                        int64_t divisibleTileSize,
+                                        double maxWaste) {
+  if (ShapedType::isDynamic(numElem) || numElem <= 0 || maxWaste <= 0.0) {
+    return divisibleTileSize;
+  }
+  int64_t dist = numElem;
+  if (distTileSize > 0 && !ShapedType::isDynamic(distTileSize) &&
+      distTileSize < numElem) {
+    dist = distTileSize;
+  }
+  const int64_t numFullDistTiles = numElem / dist;
+  const int64_t lastDistTile = numElem % dist;
+  const int64_t step = tileSize >= vectorSize ? vectorSize : 1;
+  const int64_t start = std::min(tileSize, dist) / step * step;
+  for (int64_t t = start; t > divisibleTileSize; t -= step) {
+    int64_t waste = numFullDistTiles * (llvm::divideCeil(dist, t) * t - dist);
+    if (lastDistTile) {
+      waste += llvm::divideCeil(lastDistTile, t) * t - lastDistTile;
+    }
+    if (static_cast<double>(waste) <=
+        maxWaste * static_cast<double>(numElem)) {
+      return t;
+    }
+  }
+  return divisibleTileSize;
+}
+
 // Returns true if `map` is a function of `dim` and is not a function of any
 // more inner dimensions past `dim`.
 static bool isInnerMostDimThatMapIsFunctionOf(AffineMap map, int dim) {
@@ -1218,6 +1269,8 @@ setMatmulRootConfig(mlir::FunctionOpInterface entryPointFn,
   SmallVector<int64_t> vecTileSizes;
   SmallVector<bool> vecScalableFlags;
   int numScalableDims = llvm::count(inputVecScalableDims, true);
+  SmallVector<utils::IteratorType> iteratorTypes =
+      linalgOp.getIteratorTypesArray();
   for (auto [index, tileSize] : llvm::enumerate(inputVecTileSizes)) {
     int64_t sz = tileSize;
     bool isScalable = inputVecScalableDims[index];
@@ -1228,9 +1281,26 @@ setMatmulRootConfig(mlir::FunctionOpInterface entryPointFn,
     // For ArmSME (the only current user of 2D scalable vectors), tile sizes
     // must match SME tiles (and cannot be arbitrarily resized).
     if (sz != 0 && (numScalableDims < 2 || !isScalable)) {
-      sz = getMaxVectorTileSize(
+      int64_t divisibleSz = getMaxVectorTileSize(
           /*numElem=*/shape[index],
           /*tileSize=*/sz, vectorSize, enforcePowerOfTwo);
+      // With masking, a partial vector tile is handled by the masks, so a
+      // dividing tile is not required (as setVectorTileSizes already does for
+      // generic ops). Keep the dividing tile when it is more than half of the
+      // target; otherwise use the largest partial tile within the waste bound.
+      // Reduction dims are left alone so the accumulation order is unchanged.
+      if (vecPreProcStrategy == VectorPreProcStrategy::Masking &&
+          !isScalable && clMatmulPartialVectorTileMaxWaste > 0.0 &&
+          index < iteratorTypes.size() &&
+          iteratorTypes[index] == utils::IteratorType::parallel &&
+          divisibleSz * 2 <= sz) {
+        divisibleSz = getPartialVectorTileSize(
+            shape[index],
+            index < distTileSizes.size() ? distTileSizes[index] : 0,
+            /*tileSize=*/sz, vectorSize, divisibleSz,
+            clMatmulPartialVectorTileMaxWaste);
+      }
+      sz = divisibleSz;
     }
     vecTileSizes.push_back(sz);
     // 1x scalable vectors e.g. vector<[1]xty> are also poorly supported, so
