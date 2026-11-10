@@ -18,6 +18,7 @@
 #include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/InterleavedRange.h"
@@ -464,6 +465,49 @@ static bool tileMatmulMToWorkgroupY(const int64_t dimM,
   return false;
 }
 
+// research/inception-opt: allow a partial last workgroup tile along M when the
+// divisible search above can only give a single workgroup row (y = 1). 0
+// disables it (previous behavior).
+static llvm::cl::opt<double> clSPIRVMatmulPartialMMaxWaste(
+    "iree-spirv-matmul-partial-m-max-waste",
+    llvm::cl::desc(
+        "Maximum padding waste (fraction of M) allowed when tiling matmul M "
+        "to workgroup Y with a tile that does not divide M. Used only when "
+        "no divisible tile gives more than one workgroup row and the "
+        "promotion pipeline can be used; 0 disables partial M tiles"),
+    llvm::cl::init(0.125));
+
+/// Like tileMatmulMToWorkgroupY, but the workgroup tile may leave a partial
+/// last tile along M: ceil(dimM / tile) * tile - dimM must stay within
+/// `maxWaste * dimM`. This is meant for M without small power-of-two factors,
+/// e.g. M = OH * OW of convolutions with odd spatial sizes (17x17 = 289,
+/// 35x35 = 1225), where the divisible search ends with y = 1.
+static bool tileMatmulMToWorkgroupYPartial(const int64_t dimM,
+                                           const int64_t bestThreadM,
+                                           const int64_t residualThreads,
+                                           const double maxWaste,
+                                           int64_t &wgDimSize,
+                                           int64_t &wgTileSize,
+                                           int64_t &threadTileSize) {
+  for (int64_t y = residualThreads; y >= 2; y >>= 1) {
+    for (int64_t t = bestThreadM; t >= 1; --t) {
+      const int64_t tile = y * t;
+      if (tile > dimM) {
+        continue;
+      }
+      const int64_t padded = llvm::divideCeil(dimM, tile) * tile;
+      if (static_cast<double>(padded - dimM) <=
+          maxWaste * static_cast<double>(dimM)) {
+        wgDimSize = y;
+        wgTileSize = tile;
+        threadTileSize = t;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 /// Decides the tiling parameters for matmul's K dimension.
 static bool tileMatmulK(const int64_t dimK, const int64_t residualTilingFactor,
                         int64_t &tileSize) {
@@ -713,12 +757,50 @@ LogicalResult setMatmulOpConfig(IREE::GPU::TargetAttr target,
 
   if (!tileMatmulNToWorkgroupX(dimN, bestThreadN, residualThreads, bestX,
                                residualTilingFactor, workgroupSize[0],
-                               workgroupTileSizes[nIndex]) ||
-      !tileMatmulMToWorkgroupY(dimM, bestThreadM, residualThreads, bestY,
+                               workgroupTileSizes[nIndex])) {
+    return failure();
+  }
+  const int64_t residualTilingFactorAfterN = residualTilingFactor;
+  if (!tileMatmulMToWorkgroupY(dimM, bestThreadM, residualThreads, bestY,
                                residualTilingFactor, workgroupSize[1],
                                workgroupTileSizes[mIndex]) ||
       !tileMatmulK(dimK, residualTilingFactor, reductionTileSizes[kIndex])) {
     return failure();
+  }
+
+  // The divisible search gives a single workgroup row (y = 1) for M without
+  // small power-of-two factors, which also rules out the promotion pipeline
+  // (too few threads). Try a partial last M tile instead; it is kept only if
+  // the promotion pipeline accepts it below, otherwise the divisible
+  // configuration is restored.
+  const auto divisibleWorkgroupSize = workgroupSize;
+  const auto divisibleWorkgroupTileSizes = workgroupTileSizes;
+  const auto divisibleReductionTileSizes = reductionTileSizes;
+  bool partialM = false;
+  // Named matmul ops are left alone: verifySPIRVMatmulPromoteVectorizePass-
+  // Pipeline requires divisible tiles for them. The SPIR-V configuration
+  // pipeline generalizes named ops (GPUGeneralizeNamedOpsPass) before this
+  // point, so real dispatches reach here as linalg.generic.
+  if (enablePromotion && clSPIRVMatmulPartialMMaxWaste > 0.0 &&
+      workgroupSize[1] == 1 && residualThreads > 1 && !isBM &&
+      !isa<linalg::MatmulOp, linalg::BatchMatmulOp>(op.getOperation())) {
+    int64_t partialY = 0, partialTile = 0, partialThreadM = 0, partialK = 0;
+    if (tileMatmulMToWorkgroupYPartial(dimM, bestThreadM, residualThreads,
+                                       clSPIRVMatmulPartialMMaxWaste, partialY,
+                                       partialTile, partialThreadM) &&
+        dimM % partialTile != 0 &&
+        // Only worth it if the workgroup covers more rows than the divisible
+        // single-row choice (e.g. not for M = 49, where the divisible tile is
+        // 7 and the best partial tile within the waste bound is 4).
+        partialTile > divisibleWorkgroupTileSizes[mIndex] &&
+        residualTilingFactorAfterN > partialThreadM &&
+        tileMatmulK(dimK, residualTilingFactorAfterN - partialThreadM,
+                    partialK)) {
+      workgroupSize[1] = partialY;
+      workgroupTileSizes[mIndex] = partialTile;
+      reductionTileSizes[kIndex] = partialK;
+      partialM = true;
+    }
   }
   LLVM_DEBUG(llvm::dbgs() << "workgroup tile size before promotion = "
                           << llvm::interleaved_array(workgroupTileSizes)
@@ -751,6 +833,16 @@ LogicalResult setMatmulOpConfig(IREE::GPU::TargetAttr target,
     storeStage = 1;
   }
 
+  // A partial M tile makes the promoted shared memory tile dynamic in the last
+  // workgroup; multi-buffering (depth > 1) then fails to allocate it, so use a
+  // single buffer.
+  const auto divisiblePipelineDepth = pipelineDepth;
+  const auto divisibleStoreStage = storeStage;
+  if (partialM) {
+    pipelineDepth = std::min<unsigned>(pipelineDepth, 1u);
+    storeStage = 1;
+  }
+
   // Try to adjust tiling sizes to fit in shared memory.
   auto usePromotionPipeline =
       enablePromotion &&
@@ -758,6 +850,22 @@ LogicalResult setMatmulOpConfig(IREE::GPU::TargetAttr target,
                       workgroupTileSizes[nIndex], reductionTileSizes[kIndex],
                       workgroupSize, pipelineDepth, storeStage, subgroupSize,
                       maxBytes, elementBits);
+  if (partialM && !usePromotionPipeline) {
+    // Only the promotion pipeline is used with a partial M tile; restore the
+    // divisible configuration and decide as before.
+    workgroupSize = divisibleWorkgroupSize;
+    workgroupTileSizes = divisibleWorkgroupTileSizes;
+    reductionTileSizes = divisibleReductionTileSizes;
+    pipelineDepth = divisiblePipelineDepth;
+    storeStage = divisibleStoreStage;
+    partialM = false;
+    usePromotionPipeline =
+        enablePromotion &&
+        adjustToPromote({dimM, dimN, dimK}, workgroupTileSizes[mIndex],
+                        workgroupTileSizes[nIndex], reductionTileSizes[kIndex],
+                        workgroupSize, pipelineDepth, storeStage, subgroupSize,
+                        maxBytes, elementBits);
+  }
 
   // Tile all additional reduction dimensions with size 1 to materialize loops.
   for (auto [i, it] : llvm::enumerate(op.getIteratorTypesArray())) {

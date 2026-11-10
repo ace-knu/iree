@@ -1,4 +1,5 @@
 // RUN: iree-opt --split-input-file --iree-gpu-test-target=rdna2@vulkan --pass-pipeline='builtin.module(iree-spirv-select-lowering-strategy-pass)' %s | FileCheck %s
+// RUN: iree-opt --split-input-file --iree-gpu-test-target=rdna2@vulkan --iree-spirv-matmul-partial-m-max-waste=0 --pass-pipeline='builtin.module(iree-spirv-select-lowering-strategy-pass)' %s | FileCheck %s --check-prefix=OFF
 
 func.func @batch_matmul_f32_16x4096x40x4096(%3: tensor<16x4096x4096xf32>, %4: tensor<16x4096x40xf32>, %5: tensor<16x4096x40xf32>) -> tensor<16x4096x40xf32> {
   %6 = linalg.batch_matmul ins(%3, %4 : tensor<16x4096x4096xf32>, tensor<16x4096x40xf32>) outs(%5 : tensor<16x4096x40xf32>) -> tensor<16x4096x40xf32>
@@ -105,5 +106,95 @@ func.func @matmul_multi_reduce_i4xf32xf32(%15: tensor<11008x32x128xi4>, %16: ten
 //      CHECK: func.func @matmul_multi_reduce_i4xf32xf32(
 // CHECK-SAME:     translation_info = #[[TRANSLATION]]
 //      CHECK:   linalg.generic
+//      CHECK:   linalg.generic
+// CHECK-SAME:     lowering_config = #[[CONFIG]]
+
+// -----
+
+// Partial last M tile (research/inception-opt, --iree-spirv-matmul-partial-m-max-waste):
+// M = 289 (17x17 conv im2col) has no divisible tile with more than one
+// workgroup row. A 64-row tile wastes 31/289 <= 12.5% and enables the
+// promotion pipeline, with a single buffer (no multi-buffering).
+
+#map_a = affine_map<(d0, d1, d2) -> (d0, d2)>
+#map_b = affine_map<(d0, d1, d2) -> (d2, d1)>
+#map_c = affine_map<(d0, d1, d2) -> (d0, d1)>
+func.func @generic_matmul_f32_289x384x1024(%a: tensor<289x1024xf32>, %b: tensor<1024x384xf32>) -> tensor<289x384xf32> {
+  %cst = arith.constant 0.000000e+00 : f32
+  %e = tensor.empty() : tensor<289x384xf32>
+  %f = linalg.fill ins(%cst : f32) outs(%e : tensor<289x384xf32>) -> tensor<289x384xf32>
+  %r = linalg.generic {indexing_maps = [#map_a, #map_b, #map_c], iterator_types = ["parallel", "parallel", "reduction"]} ins(%a, %b : tensor<289x1024xf32>, tensor<1024x384xf32>) outs(%f : tensor<289x384xf32>) {
+  ^bb0(%x: f32, %y: f32, %acc: f32):
+    %m = arith.mulf %x, %y : f32
+    %s = arith.addf %acc, %m : f32
+    linalg.yield %s : f32
+  } -> tensor<289x384xf32>
+  return %r : tensor<289x384xf32>
+}
+
+//  CHECK-DAG: #[[CONFIG:.+]] = #iree_codegen.lowering_config<tile_sizes = {{\[}}[64, 64, 16]{{\]}}>
+//  CHECK-DAG: #[[TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = #iree_gpu.spirv_pipeline<MatmulPromoteVectorize> workgroup_size = [16, 8, 1], {pipeline_depth = 1 : i64, store_stage = 1 : i64}>
+//      CHECK: func.func @generic_matmul_f32_289x384x1024(
+// CHECK-SAME:     translation_info = #[[TRANSLATION]]
+//      CHECK:   linalg.generic
+// CHECK-SAME:     lowering_config = #[[CONFIG]]
+
+//  OFF-DAG: #iree_codegen.lowering_config<tile_sizes = {{\[}}[1, 64], [1, 4], [0, 0, 16]{{\]}}>
+//  OFF-DAG: #iree_codegen.translation_info<pipeline = #iree_gpu.spirv_pipeline<BaseVectorize> workgroup_size = [16, 1, 1]>
+//      OFF: func.func @generic_matmul_f32_289x384x1024(
+
+// -----
+
+// M = 1225 (35x35): the divisible choice is a 7-row tile in one workgroup row;
+// a 128-row tile (waste 55/1225) with 16 workgroup rows is used instead.
+
+#map_a = affine_map<(d0, d1, d2) -> (d0, d2)>
+#map_b = affine_map<(d0, d1, d2) -> (d2, d1)>
+#map_c = affine_map<(d0, d1, d2) -> (d0, d1)>
+func.func @generic_matmul_f32_1225x96x576(%a: tensor<1225x576xf32>, %b: tensor<576x96xf32>) -> tensor<1225x96xf32> {
+  %cst = arith.constant 0.000000e+00 : f32
+  %e = tensor.empty() : tensor<1225x96xf32>
+  %f = linalg.fill ins(%cst : f32) outs(%e : tensor<1225x96xf32>) -> tensor<1225x96xf32>
+  %r = linalg.generic {indexing_maps = [#map_a, #map_b, #map_c], iterator_types = ["parallel", "parallel", "reduction"]} ins(%a, %b : tensor<1225x576xf32>, tensor<576x96xf32>) outs(%f : tensor<1225x96xf32>) {
+  ^bb0(%x: f32, %y: f32, %acc: f32):
+    %m = arith.mulf %x, %y : f32
+    %s = arith.addf %acc, %m : f32
+    linalg.yield %s : f32
+  } -> tensor<1225x96xf32>
+  return %r : tensor<1225x96xf32>
+}
+
+//  CHECK-DAG: #[[CONFIG:.+]] = #iree_codegen.lowering_config<tile_sizes = {{\[}}[128, 32, 16]{{\]}}>
+//  CHECK-DAG: #[[TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = #iree_gpu.spirv_pipeline<MatmulPromoteVectorize> workgroup_size = [8, 16, 1], {pipeline_depth = 1 : i64, store_stage = 1 : i64}>
+//      CHECK: func.func @generic_matmul_f32_1225x96x576(
+// CHECK-SAME:     translation_info = #[[TRANSLATION]]
+//      CHECK:   linalg.generic
+// CHECK-SAME:     lowering_config = #[[CONFIG]]
+
+// -----
+
+// M = 49: no partial tile within the waste bound covers more than the
+// divisible 7-row tile, so the configuration is unchanged.
+
+#map_a = affine_map<(d0, d1, d2) -> (d0, d2)>
+#map_b = affine_map<(d0, d1, d2) -> (d2, d1)>
+#map_c = affine_map<(d0, d1, d2) -> (d0, d1)>
+func.func @generic_matmul_f32_49x64x576(%a: tensor<49x576xf32>, %b: tensor<576x64xf32>) -> tensor<49x64xf32> {
+  %cst = arith.constant 0.000000e+00 : f32
+  %e = tensor.empty() : tensor<49x64xf32>
+  %f = linalg.fill ins(%cst : f32) outs(%e : tensor<49x64xf32>) -> tensor<49x64xf32>
+  %r = linalg.generic {indexing_maps = [#map_a, #map_b, #map_c], iterator_types = ["parallel", "parallel", "reduction"]} ins(%a, %b : tensor<49x576xf32>, tensor<576x64xf32>) outs(%f : tensor<49x64xf32>) {
+  ^bb0(%x: f32, %y: f32, %acc: f32):
+    %m = arith.mulf %x, %y : f32
+    %s = arith.addf %acc, %m : f32
+    linalg.yield %s : f32
+  } -> tensor<49x64xf32>
+  return %r : tensor<49x64xf32>
+}
+
+//  CHECK-DAG: #[[CONFIG:.+]] = #iree_codegen.lowering_config<tile_sizes = {{\[}}[7, 64], [7, 4], [0, 0, 16]{{\]}}>
+//  CHECK-DAG: #[[TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = #iree_gpu.spirv_pipeline<BaseVectorize> workgroup_size = [16, 1, 1]>
+//      CHECK: func.func @generic_matmul_f32_49x64x576(
+// CHECK-SAME:     translation_info = #[[TRANSLATION]]
 //      CHECK:   linalg.generic
 // CHECK-SAME:     lowering_config = #[[CONFIG]]
