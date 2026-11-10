@@ -5,6 +5,9 @@
 // RUN: iree-opt --pass-pipeline='builtin.module(func.func(linalg-generalize-named-ops),iree-llvmcpu-select-lowering-strategy)' --split-input-file %s | FileCheck %s --check-prefix=GENERIC
 // Partial (masked) matmul vector tiles disabled: the previous divisor-only rule.
 // RUN: iree-opt --iree-llvmcpu-matmul-partial-vector-tile-max-waste=0 --pass-pipeline='builtin.module(iree-llvmcpu-select-lowering-strategy)' --split-input-file %s | FileCheck %s --check-prefix=OFF
+// Contraction peeling on AVX-512 (research/inception-opt rule P = all, rule P' = auto; default none).
+// RUN: iree-opt --iree-llvmcpu-x86-avx512-contraction-peeling=all --pass-pipeline='builtin.module(iree-llvmcpu-select-lowering-strategy)' --split-input-file %s | FileCheck %s --check-prefix=PEEL
+// RUN: iree-opt --iree-llvmcpu-x86-avx512-contraction-peeling=auto --pass-pipeline='builtin.module(iree-llvmcpu-select-lowering-strategy)' --split-input-file %s | FileCheck %s --check-prefix=AUTO
 
 #map = affine_map<(d0, d1) -> (d0, d1)>
 #map1 = affine_map<(d0, d1) -> (d1)>
@@ -1737,6 +1740,19 @@ func.func @matmul_partial_vector_289x160x768(%3: tensor<289x768xf32>, %4: tensor
 //        OFF: func.func @matmul_partial_vector_289x160x768(
 //        OFF:   linalg.matmul
 //   OFF-SAME:       lowering_config = #[[OFF_CONFIG]]
+//   PEEL-DAG: #[[PEEL_CONFIG:.+]] = #iree_cpu.lowering_config<cache_parallel = [64, 40, 0], distribution = [64, 40, 0], vector_common_parallel = [8, 32, 0], vector_reduction = [0, 0, 16]>
+//   PEEL-DAG: #[[PEEL_TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = #iree_cpu.pipeline<DoubleTilingExpert>, {{\{}}enable_loop_peeling}>
+//       PEEL: func.func @matmul_partial_vector_289x160x768(
+//  PEEL-SAME:     translation_info = #[[PEEL_TRANSLATION]]
+//       PEEL:   linalg.matmul
+//  PEEL-SAME:       lowering_config = #[[PEEL_CONFIG]]
+// M = 289 has no good divisor: P' peels as P.
+//   AUTO-DAG: #[[AUTO_CONFIG:.+]] = #iree_cpu.lowering_config<cache_parallel = [64, 40, 0], distribution = [64, 40, 0], vector_common_parallel = [8, 32, 0], vector_reduction = [0, 0, 16]>
+//   AUTO-DAG: #[[AUTO_TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = #iree_cpu.pipeline<DoubleTilingExpert>, {{\{}}enable_loop_peeling}>
+//       AUTO: func.func @matmul_partial_vector_289x160x768(
+//  AUTO-SAME:     translation_info = #[[AUTO_TRANSLATION]]
+//       AUTO:   linalg.matmul
+//  AUTO-SAME:       lowering_config = #[[AUTO_CONFIG]]
 
 // -----
 
@@ -1757,6 +1773,19 @@ func.func @matmul_partial_vector_5041x192x720(%3: tensor<5041x720xf32>, %4: tens
 //        OFF: func.func @matmul_partial_vector_5041x192x720(
 //        OFF:   linalg.matmul
 //   OFF-SAME:       lowering_config = #[[OFF_CONFIG]]
+//   PEEL-DAG: #[[PEEL_CONFIG:.+]] = #iree_cpu.lowering_config<cache_parallel = [64, 64, 0], distribution = [64, 64, 0], vector_common_parallel = [8, 32, 0], vector_reduction = [0, 0, 16]>
+//   PEEL-DAG: #[[PEEL_TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = #iree_cpu.pipeline<DoubleTilingExpert>, {{\{}}enable_loop_peeling}>
+//       PEEL: func.func @matmul_partial_vector_5041x192x720(
+//  PEEL-SAME:     translation_info = #[[PEEL_TRANSLATION]]
+//       PEEL:   linalg.matmul
+//  PEEL-SAME:       lowering_config = #[[PEEL_CONFIG]]
+// M = 5041: P' peels as P.
+//   AUTO-DAG: #[[AUTO_CONFIG:.+]] = #iree_cpu.lowering_config<cache_parallel = [64, 64, 0], distribution = [64, 64, 0], vector_common_parallel = [8, 32, 0], vector_reduction = [0, 0, 16]>
+//   AUTO-DAG: #[[AUTO_TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = #iree_cpu.pipeline<DoubleTilingExpert>, {{\{}}enable_loop_peeling}>
+//       AUTO: func.func @matmul_partial_vector_5041x192x720(
+//  AUTO-SAME:     translation_info = #[[AUTO_TRANSLATION]]
+//       AUTO:   linalg.matmul
+//  AUTO-SAME:       lowering_config = #[[AUTO_CONFIG]]
 
 // -----
 
@@ -1777,6 +1806,20 @@ func.func @matmul_partial_vector_1225x96x576(%3: tensor<1225x576xf32>, %4: tenso
 //        OFF: func.func @matmul_partial_vector_1225x96x576(
 //        OFF:   linalg.matmul
 //   OFF-SAME:       lowering_config = #[[OFF_CONFIG]]
+//   PEEL-DAG: #[[PEEL_CONFIG:.+]] = #iree_cpu.lowering_config<cache_parallel = [49, 48, 0], distribution = [49, 48, 0], vector_common_parallel = [8, 32, 0], vector_reduction = [0, 0, 16]>
+//   PEEL-DAG: #[[PEEL_TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = #iree_cpu.pipeline<DoubleTilingExpert>, {{\{}}enable_loop_peeling}>
+//       PEEL: func.func @matmul_partial_vector_1225x96x576(
+//  PEEL-SAME:     translation_info = #[[PEEL_TRANSLATION]]
+//       PEEL:   linalg.matmul
+//  PEEL-SAME:       lowering_config = #[[PEEL_CONFIG]]
+// M = 1225: masking takes 7-row tiles without remainder, peeling would leave a 1-row
+// remainder per 49-row distribution tile: P' keeps masking.
+//   AUTO-DAG: #[[AUTO_CONFIG:.+]] = #iree_cpu.lowering_config<distribution = [49, 48, 0], vector_common_parallel = [7, 16, 0], vector_reduction = [0, 0, 16]>
+//   AUTO-DAG: #[[AUTO_TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = #iree_cpu.pipeline<DoubleTilingExpert>>
+//       AUTO: func.func @matmul_partial_vector_1225x96x576(
+//  AUTO-SAME:     translation_info = #[[AUTO_TRANSLATION]]
+//       AUTO:   linalg.matmul
+//  AUTO-SAME:       lowering_config = #[[AUTO_CONFIG]]
 
 // -----
 
@@ -1797,3 +1840,16 @@ func.func @matmul_partial_vector_49x64x576(%3: tensor<49x576xf32>, %4: tensor<57
 //        OFF: func.func @matmul_partial_vector_49x64x576(
 //        OFF:   linalg.matmul
 //   OFF-SAME:       lowering_config = #[[OFF_CONFIG]]
+//   PEEL-DAG: #[[PEEL_CONFIG:.+]] = #iree_cpu.lowering_config<cache_parallel = [7, 64, 0], distribution = [7, 64, 0], vector_common_parallel = [8, 32, 0], vector_reduction = [0, 0, 16]>
+//   PEEL-DAG: #[[PEEL_TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = #iree_cpu.pipeline<DoubleTilingExpert>, {{\{}}enable_loop_peeling}>
+//       PEEL: func.func @matmul_partial_vector_49x64x576(
+//  PEEL-SAME:     translation_info = #[[PEEL_TRANSLATION]]
+//       PEEL:   linalg.matmul
+//  PEEL-SAME:       lowering_config = #[[PEEL_CONFIG]]
+// M = 49 (7-row distribution tiles): P' keeps masking.
+//   AUTO-DAG: #[[AUTO_CONFIG:.+]] = #iree_cpu.lowering_config<distribution = [7, 64, 0], vector_common_parallel = [7, 16, 0], vector_reduction = [0, 0, 16]>
+//   AUTO-DAG: #[[AUTO_TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = #iree_cpu.pipeline<DoubleTilingExpert>>
+//       AUTO: func.func @matmul_partial_vector_49x64x576(
+//  AUTO-SAME:     translation_info = #[[AUTO_TRANSLATION]]
+//       AUTO:   linalg.matmul
+//  AUTO-SAME:       lowering_config = #[[AUTO_CONFIG]]

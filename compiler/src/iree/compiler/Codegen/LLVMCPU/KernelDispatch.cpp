@@ -136,6 +136,37 @@ static llvm::cl::opt<bool> clDisableVectorPeeling(
                    "heuristics to select the strategy)."),
     llvm::cl::init(false));
 
+// research/inception-opt: peel contractions on x86 AVX-512 as on other x86
+// targets. With masking, a matmul vector tile that does not divide the
+// dimension keeps runtime masks (and dynamic shapes) in every tile; peeling
+// keeps the main loop static and handles the remainder in a separate loop.
+// Peeling also uses the default [8, 32, 16] vector tile. Off by default; the
+// two variants are compared before choosing a default.
+enum class X86ContractionPeeling {
+  // Masking for contractions on AVX-512 (previous behavior).
+  None,
+  // Rule P: peeling for every contraction.
+  All,
+  // Rule P': peeling, except when masking needs no partial vector tile while
+  // the peeling vector tile would leave a remainder loop in a distribution
+  // tile (e.g. M = 196 with 49-row distribution tiles: masking takes 7-row
+  // vector tiles, peeling 8-row tiles plus a 1-row remainder).
+  Auto
+};
+static llvm::cl::opt<X86ContractionPeeling> clX86Avx512ContractionPeeling(
+    "iree-llvmcpu-x86-avx512-contraction-peeling",
+    llvm::cl::desc("Vector pre-processing strategy for contraction ops on x86 "
+                   "with AVX-512 (other ops keep masking):"),
+    llvm::cl::values(
+        clEnumValN(X86ContractionPeeling::None, "none",
+                   "Masking (default, previous behavior)."),
+        clEnumValN(X86ContractionPeeling::All, "all",
+                   "Peeling for every contraction (rule P)."),
+        clEnumValN(X86ContractionPeeling::Auto, "auto",
+                   "Peeling unless masking needs no partial vector tile and "
+                   "peeling would leave a remainder loop (rule P').")),
+    llvm::cl::init(X86ContractionPeeling::None));
+
 static llvm::cl::opt<bool> clDisableArmSMETiling(
     "iree-llvmcpu-disable-arm-sme-tiling",
     llvm::cl::desc("Disables tiling for SME even if it is supported by the "
@@ -289,6 +320,16 @@ getVectorPreProcStrategy(linalg::LinalgOp linalgOp) {
   if (targetAttr && isX86(targetAttr.getConfiguration())) {
     if (isElementwiseOrReduction) {
       return VectorPreProcStrategy::Masking;
+    }
+
+    // Contractions are peeled on AVX-512 as well: with masking, a vector tile
+    // that does not divide the dimension makes every tile masked and dynamic,
+    // while peeling keeps the main loop static (measured on im2col matmuls with
+    // M = OH * OW of odd spatial sizes, e.g. 17x17 = 289).
+    if (clX86Avx512ContractionPeeling != X86ContractionPeeling::None &&
+        !clDisableVectorPeeling &&
+        linalg::isaContractionOpInterface(linalgOp)) {
+      return VectorPreProcStrategy::Peeling;
     }
 
     // AVX-512 has native opmask registers for efficient masking.
@@ -1666,6 +1707,41 @@ static bool meetLegacyContractionOpInterface(linalg::LinalgOp linalgOp) {
   return dims.size() == 1 && dims[0] == linalgOp.getNumLoops() - 1;
 }
 
+/// Rule P' (`--iree-llvmcpu-x86-avx512-contraction-peeling=auto`): returns true
+/// if masking needs no partial vector tile on any parallel dim of `linalgOp`
+/// while the peeling vector tiles would leave a remainder loop in some
+/// distribution tile; masking is then kept. A masking tile is remainder-free
+/// when the dividing tile is more than half of the target, or, on lane dims
+/// (target >= vector size), a multiple of the vector size.
+static bool maskingIsRemainderFreeButPeelingIsNot(
+    linalg::LinalgOp linalgOp, ArrayRef<int64_t> distTileSizes,
+    ArrayRef<int64_t> vecTileSizes, int64_t vectorSize) {
+  SmallVector<int64_t> shape = linalgOp.getStaticLoopRanges();
+  SmallVector<utils::IteratorType> iterators =
+      linalgOp.getIteratorTypesArray();
+  bool peelingLeavesRemainder = false;
+  for (auto [i, tile] : llvm::enumerate(vecTileSizes)) {
+    if (i >= shape.size() || iterators[i] != utils::IteratorType::parallel ||
+        tile <= 1 || ShapedType::isDynamic(shape[i])) {
+      continue;
+    }
+    int64_t divisible = getMaxVectorTileSize(shape[i], tile, vectorSize);
+    bool maskingRemainderFree =
+        divisible * 2 > tile ||
+        (tile >= vectorSize && divisible % vectorSize == 0);
+    if (!maskingRemainderFree) {
+      return false;
+    }
+    int64_t dist = (i < distTileSizes.size() && distTileSizes[i] > 0)
+                       ? distTileSizes[i]
+                       : shape[i];
+    if (dist % tile != 0) {
+      peelingLeavesRemainder = true;
+    }
+  }
+  return peelingLeavesRemainder;
+}
+
 /// Sets the lowering configuration for dispatch region with root op that
 /// implements the contraction operation interface.
 static LogicalResult
@@ -1754,6 +1830,18 @@ setContractionRootConfig(mlir::FunctionOpInterface entryPointFn,
   // the `getDefaultDistributedLevelTileSizes` above may return sizes that are
   // smaller than `minTileSizes`, so we have to adjust the cache sizes again.
   cacheTileSizes = distTileSizes;
+
+  // Rule P': keep masking when it is remainder-free and peeling is not.
+  if (usePeelingPipeline &&
+      clX86Avx512ContractionPeeling == X86ContractionPeeling::Auto &&
+      targetAttr && isX86(targetAttr.getConfiguration()) &&
+      hasAVX512fFeature(targetAttr.getConfiguration()) &&
+      maskingIsRemainderFreeButPeelingIsNot(linalgOp, distTileSizes,
+                                            vecTileSizes, vectorSize)) {
+    vecPreProcStrategy = VectorPreProcStrategy::Masking;
+    usePeelingPipeline = false;
+    LDBG() << "Rule P': keeping masking for this contraction";
+  }
 
   LDBG() << "Distribution tile sizes: " << distTileSizes;
   LDBG() << "Cache tile sizes: " << cacheTileSizes;
