@@ -19,6 +19,7 @@
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include "iree/compiler/Codegen/SPIRV/KernelConfig.h"
 #include "iree/compiler/Codegen/SPIRV/Passes.h"
+#include "iree/compiler/Codegen/Utils/CodegenOptions.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/MarkerUtils.h"
 #include "iree/compiler/Dialect/Util/Transforms/Passes.h"
@@ -637,6 +638,11 @@ static void buildSPIRVCodegenConfigurationPassPipelineImpl(
     addCommonTargetExecutablePreprocessingPasses(funcPassManager);
     addEncodingToNopPasses(funcPassManager);
   }
+  // Load `--iree-codegen-tuning-spec-path` (and default tuning specs) so that
+  // MaterializeUserConfigs can apply them, as the LLVMCPU and LLVMGPU
+  // configuration pipelines do. The path is passed explicitly, like LLVMCPU.
+  modulePassManager.addPass(createMaterializeTuningSpecsPass(
+      MaterializeTuningSpecsPassOptions{CodegenOptions::tuningSpecPath}));
   modulePassManager.addPass(createMaterializeUserConfigsPass());
   modulePassManager.addPass(createSPIRVSelectLoweringStrategyPass());
 }
