@@ -94,6 +94,20 @@ def SPIRVMaterializeExecutableConditionsPass :
                 "ops into hal.executable.condition regions";
 }
 
+def SPIRVShiftPartialMatmulTilePass :
+    InterfacePass<"iree-spirv-shift-partial-matmul-tile", "mlir::FunctionOpInterface"> {
+  let summary = "Make partial workgroup tiles of a contraction static by "
+                "shifting the last tile back to min(offset, extent - tile) and "
+                "inserting only the workgroup's own part of the result, so "
+                "that promotion, vectorization and multi-buffering see static "
+                "shapes";
+  let dependentDialects = [
+    "::mlir::affine::AffineDialect",
+    "::mlir::linalg::LinalgDialect",
+    "::mlir::tensor::TensorDialect"
+  ];
+}
+
 def SPIRVSelectLoweringStrategyPass :
     Pass<"iree-spirv-select-lowering-strategy-pass", "ModuleOp"> {
   let summary = "Select the IREE::HAL::DispatchLoweringPassPipeline for lowering"

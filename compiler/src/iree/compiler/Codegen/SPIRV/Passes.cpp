@@ -56,6 +56,20 @@ static llvm::cl::opt<int> clSPIRVIndexingBits(
     llvm::cl::desc("Set the bit width of indices in SPIR-V."),
     llvm::cl::init(32));
 
+// research/inception-opt: make partial workgroup tiles of the matmul static
+// (SPIRVShiftPartialMatmulTile).
+// Off by default: correct, but the fresh accumulator lives in workgroup memory
+// and is not hoisted to registers across the K-loop barriers, so it is not
+// faster yet (docs: research/inception-opt plan B-1).
+static llvm::cl::opt<bool> clSPIRVShiftPartialMatmulTiles(
+    "iree-spirv-shift-partial-matmul-tiles",
+    llvm::cl::desc(
+        "In the MatmulPromoteVectorize pipeline, shift a partial workgroup "
+        "tile of a matmul back so that it is a full static tile (the overlap "
+        "is computed twice into a fresh accumulator, only the own part is "
+        "stored). False (default) keeps it dynamically shaped"),
+    llvm::cl::init(false));
+
 //===----------------------------------------------------------------------===//
 // Bufferization Configuration
 //===----------------------------------------------------------------------===//
@@ -494,6 +508,15 @@ void addSPIRVMatmulPromoteVectorizePassPipeline(OpPassManager &funcPassManager,
   addTileAndDistributeToWorkgroupsPasses(
       funcPassManager, /*useFuseTensorPadWithConsumerPass=*/false,
       /*useWARForCooperativeMatrixCodegen=*/true);
+
+  // A partial workgroup tile (no workgroup specialization here) leaves the
+  // matmul dynamically shaped, which blocks promotion and vectorization; shift
+  // it back so that it is a full static tile.
+  if (clSPIRVShiftPartialMatmulTiles) {
+    funcPassManager.addPass(createSPIRVShiftPartialMatmulTilePass());
+    funcPassManager.addPass(createCanonicalizerPass());
+    funcPassManager.addPass(createCSEPass());
+  }
 
   // Promote to workgroups and tile to threads.
   funcPassManager.addPass(createGPUTensorTileToSerialLoopsPass());
