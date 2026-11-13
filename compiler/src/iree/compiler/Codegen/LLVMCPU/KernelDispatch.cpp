@@ -167,6 +167,22 @@ static llvm::cl::opt<X86ContractionPeeling> clX86Avx512ContractionPeeling(
                    "peeling would leave a remainder loop (rule P').")),
     llvm::cl::init(X86ContractionPeeling::None));
 
+// research/inception-opt: rule D (divisor tiles). On x86 with AVX-512, an f32
+// contraction whose M is not a multiple of the default 8-row vector tile and
+// has no divisor in [5, 8] (e.g. M = 289 = 17 * 17, the im2col matmul of a
+// 17x17 convolution) is peeled with a remainder loop in every distribution
+// tile. Rule D uses the smallest divisor of M in [9, 30] whose accumulators
+// still fit the vector register file as the M vector tile instead, so the
+// main loop covers M exactly. Off by default.
+static llvm::cl::opt<bool> clX86Avx512MatmulDivisorTiles(
+    "iree-llvmcpu-x86-avx512-matmul-divisor-tiles",
+    llvm::cl::desc(
+        "On x86 with AVX-512, for f32 contractions whose static M has no "
+        "divisor in [5, 8], use the smallest divisor of M in [9, 30] that "
+        "keeps the accumulators in the vector registers as the M vector tile, "
+        "with peeling (rule D). False (default) keeps the previous behavior"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<bool> clDisableArmSMETiling(
     "iree-llvmcpu-disable-arm-sme-tiling",
     llvm::cl::desc("Disables tiling for SME even if it is supported by the "
@@ -1742,6 +1758,112 @@ static bool maskingIsRemainderFreeButPeelingIsNot(
   return peelingLeavesRemainder;
 }
 
+/// M and N vector tile sizes chosen by rule D.
+struct DivisorVectorTile {
+  int64_t m;
+  int64_t n;
+};
+
+/// Rule D (`--iree-llvmcpu-x86-avx512-matmul-divisor-tiles`): returns the M and
+/// N vector tile sizes for an f32 (M, N, K) contraction on x86 with AVX-512
+/// when the default vector tile is `vecTileSizes` = [8, 2 * V, V] (V = vector
+/// size), M and N are static, M is not a multiple of 8 and has no divisor in
+/// [5, 8]. The M tile is the smallest divisor d of M in [9, 30] such that the
+/// accumulators (d * Nv / V registers), one RHS row (Nv / V) and one LHS
+/// broadcast fit the vector registers, and the vector.contract stays below the
+/// large-vector check. Nv is 2 * V when d <= 14 and it divides N, else V
+/// (which must divide N). Returns std::nullopt when the rule does not apply.
+static std::optional<DivisorVectorTile>
+getX86Avx512DivisorVectorTile(linalg::LinalgOp linalgOp,
+                              ArrayRef<int64_t> vecTileSizes,
+                              int64_t vectorSize) {
+  if (!clX86Avx512MatmulDivisorTiles) {
+    return std::nullopt;
+  }
+  auto targetAttr = IREE::HAL::ExecutableTargetAttr::lookup(linalgOp);
+  if (!targetAttr || !isX86(targetAttr.getConfiguration()) ||
+      !hasAVX512fFeature(targetAttr.getConfiguration())) {
+    return std::nullopt;
+  }
+  auto isF32 = [](Value v) { return getElementTypeOrSelf(v.getType()).isF32(); };
+  if (!isF32(linalgOp.getDpsInputOperand(0)->get()) ||
+      !isF32(linalgOp.getDpsInputOperand(1)->get()) ||
+      !isF32(linalgOp.getDpsInitOperand(0)->get())) {
+    return std::nullopt;
+  }
+  // Plain (M, N, K) contractions only: no batch dimension.
+  FailureOr<linalg::ContractionDimensions> cDims =
+      linalg::inferContractionDims(linalgOp);
+  if (failed(cDims) || !cDims->batch.empty() || cDims->m.size() != 1 ||
+      cDims->n.size() != 1 || cDims->k.size() != 1 || cDims->m[0] != 0 ||
+      cDims->n[0] != 1 || cDims->k[0] != 2 || vecTileSizes.size() != 3 ||
+      vecTileSizes[0] != 8 || vecTileSizes[1] != 2 * vectorSize ||
+      vecTileSizes[2] != vectorSize) {
+    return std::nullopt;
+  }
+  SmallVector<int64_t> shape = linalgOp.getStaticLoopRanges();
+  int64_t dimM = shape[0], dimN = shape[1];
+  if (ShapedType::isDynamic(dimM) || ShapedType::isDynamic(dimN) ||
+      dimM % 8 == 0) {
+    return std::nullopt;
+  }
+  for (int64_t d = 5; d <= 8; ++d) {
+    if (dimM % d == 0) {
+      return std::nullopt;
+    }
+  }
+  int registerSpaceBits = getRegisterSpaceBitsIfKnown(targetAttr);
+  int64_t numRegisters = registerSpaceBits / (vectorSize * 32);
+  int64_t maxVectorBytes = getMaxVectorSizeForLargeVectorCheck(targetAttr);
+  auto fits = [&](int64_t d, int64_t n) {
+    int64_t regsPerRow = n / vectorSize;
+    return d * regsPerRow + regsPerRow + 1 <= numRegisters &&
+           d * n * vecTileSizes[2] * 4 < maxVectorBytes;
+  };
+  for (int64_t d = 9; d <= 30; ++d) {
+    if (dimM % d != 0) {
+      continue;
+    }
+    int64_t n = (d <= 14 && dimN % (2 * vectorSize) == 0 &&
+                 fits(d, 2 * vectorSize))
+                    ? 2 * vectorSize
+                    : vectorSize;
+    if (dimN % n != 0 || !fits(d, n)) {
+      continue;
+    }
+    return DivisorVectorTile{d, n};
+  }
+  return std::nullopt;
+}
+
+/// Rule D: distribution tile sizes for a divisor vector tile. M takes the
+/// multiple of the M vector tile nearest to 32 rows; N keeps the default
+/// distribution tile when it is a multiple of the N vector tile dividing N,
+/// otherwise the multiple of the N vector tile dividing N nearest to it.
+static void adjustDistributionForDivisorVectorTile(
+    linalg::LinalgOp linalgOp, const DivisorVectorTile &tile,
+    SmallVectorImpl<int64_t> &distTileSizes) {
+  SmallVector<int64_t> shape = linalgOp.getStaticLoopRanges();
+  int64_t dimM = shape[0], dimN = shape[1];
+  distTileSizes[0] =
+      std::min(dimM, tile.m * std::max<int64_t>(1, (32 + tile.m / 2) / tile.m));
+  int64_t distN = distTileSizes[1];
+  if (distN > 0 && distN % tile.n == 0 && dimN % distN == 0) {
+    return;
+  }
+  int64_t target = distN > 0 ? distN : clDefaultDistTileSize;
+  int64_t best = 0;
+  for (int64_t c = tile.n; c <= dimN; c += tile.n) {
+    if (dimN % c == 0 &&
+        (best == 0 || std::abs(c - target) < std::abs(best - target))) {
+      best = c;
+    }
+  }
+  if (best > 0) {
+    distTileSizes[1] = best;
+  }
+}
+
 /// Sets the lowering configuration for dispatch region with root op that
 /// implements the contraction operation interface.
 static LogicalResult
@@ -1771,6 +1893,18 @@ setContractionRootConfig(mlir::FunctionOpInterface entryPointFn,
   auto vecPreProcStrategy = getVectorPreProcStrategy(linalgOp);
   bool usePeelingPipeline =
       vecPreProcStrategy == VectorPreProcStrategy::Peeling;
+
+  // Rule D: an M vector tile that divides M, with peeling.
+  std::optional<DivisorVectorTile> divisorTile =
+      getX86Avx512DivisorVectorTile(linalgOp, vecTileSizes, vectorSize);
+  if (divisorTile) {
+    vecTileSizes[0] = divisorTile->m;
+    vecTileSizes[1] = divisorTile->n;
+    vecPreProcStrategy = VectorPreProcStrategy::Peeling;
+    usePeelingPipeline = true;
+    LDBG() << "Rule D: divisor vector tile [" << divisorTile->m << ", "
+           << divisorTile->n << "]";
+  }
 
   LDBG() << "Vector pre-processing strategy: " << vecPreProcStrategy;
 
@@ -1821,6 +1955,10 @@ setContractionRootConfig(mlir::FunctionOpInterface entryPointFn,
   }
   SmallVector<int64_t> distTileSizes =
       getDefaultDistributedLevelTileSizes(linalgOp, distConfig);
+  if (divisorTile) {
+    adjustDistributionForDivisorVectorTile(linalgOp, *divisorTile,
+                                           distTileSizes);
+  }
 
   // TODO: We set cache tile sizes to the distribution sizes for now (no-op) to
   // make sure there are no performance changes. This will let us change the
@@ -1831,8 +1969,9 @@ setContractionRootConfig(mlir::FunctionOpInterface entryPointFn,
   // smaller than `minTileSizes`, so we have to adjust the cache sizes again.
   cacheTileSizes = distTileSizes;
 
-  // Rule P': keep masking when it is remainder-free and peeling is not.
-  if (usePeelingPipeline &&
+  // Rule P': keep masking when it is remainder-free and peeling is not. A rule
+  // D tile divides M and its distribution tile, so it keeps peeling.
+  if (!divisorTile && usePeelingPipeline &&
       clX86Avx512ContractionPeeling == X86ContractionPeeling::Auto &&
       targetAttr && isX86(targetAttr.getConfiguration()) &&
       hasAVX512fFeature(targetAttr.getConfiguration()) &&

@@ -8,6 +8,8 @@
 // Contraction peeling on AVX-512 (research/inception-opt rule P = all, rule P' = auto; default none).
 // RUN: iree-opt --iree-llvmcpu-x86-avx512-contraction-peeling=all --pass-pipeline='builtin.module(iree-llvmcpu-select-lowering-strategy)' --split-input-file %s | FileCheck %s --check-prefix=PEEL
 // RUN: iree-opt --iree-llvmcpu-x86-avx512-contraction-peeling=auto --pass-pipeline='builtin.module(iree-llvmcpu-select-lowering-strategy)' --split-input-file %s | FileCheck %s --check-prefix=AUTO
+// Rule D (research/inception-opt divisor tiles, default off) on top of rule P'.
+// RUN: iree-opt --iree-llvmcpu-x86-avx512-contraction-peeling=auto --iree-llvmcpu-x86-avx512-matmul-divisor-tiles --pass-pipeline='builtin.module(iree-llvmcpu-select-lowering-strategy)' --split-input-file %s | FileCheck %s --check-prefix=DIV
 
 #map = affine_map<(d0, d1) -> (d0, d1)>
 #map1 = affine_map<(d0, d1) -> (d1)>
@@ -1753,6 +1755,109 @@ func.func @matmul_partial_vector_289x160x768(%3: tensor<289x768xf32>, %4: tensor
 //  AUTO-SAME:     translation_info = #[[AUTO_TRANSLATION]]
 //       AUTO:   linalg.matmul
 //  AUTO-SAME:       lowering_config = #[[AUTO_CONFIG]]
+// Rule D does not apply here: this target has 16-byte native vectors, so the
+// AVX-512 default tile [8, 32, 16] does not match its 4-lane vector size (the
+// rule needs [8, 2V, V], V = vector size). Same as rule P'.
+//    DIV-DAG: #[[DIV_CONFIG:.+]] = #iree_cpu.lowering_config<cache_parallel = [64, 40, 0], distribution = [64, 40, 0], vector_common_parallel = [8, 32, 0], vector_reduction = [0, 0, 16]>
+//    DIV-DAG: #[[DIV_TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = #iree_cpu.pipeline<DoubleTilingExpert>, {{\{}}enable_loop_peeling}>
+//        DIV: func.func @matmul_partial_vector_289x160x768(
+//   DIV-SAME:     translation_info = #[[DIV_TRANSLATION]]
+//        DIV:   linalg.matmul
+//   DIV-SAME:       lowering_config = #[[DIV_CONFIG]]
+
+// -----
+
+// Rule D (64-byte AVX-512 vectors, V = 16): M = 289 = 17 * 17 has no divisor in
+// [5, 8], so the M vector tile is the divisor 17 with N 16 (17 x 32 would not fit
+// the 32 zmm registers) and peeling. The M distribution is 34 rows; the N
+// distribution 64 is a multiple of 16 dividing 384 and is kept.
+#executable_target_avx512_ = #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu_features = "+avx512f", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128", native_vector_size = 64 : index, target_triple = "x86_64-unknown-linux-gnu"}>
+func.func @matmul_divisor_289x384x3456(%3: tensor<289x3456xf32>, %4: tensor<3456x384xf32>) -> tensor<289x384xf32> attributes {hal.executable.target = #executable_target_avx512_} {
+  %cst = arith.constant 0.000000e+00 : f32
+  %5 = tensor.empty() : tensor<289x384xf32>
+  %6 = linalg.fill ins(%cst : f32) outs(%5 : tensor<289x384xf32>) -> tensor<289x384xf32>
+  %7 = linalg.matmul ins(%3, %4 : tensor<289x3456xf32>, tensor<3456x384xf32>) outs(%6 : tensor<289x384xf32>) -> tensor<289x384xf32>
+  return %7 : tensor<289x384xf32>
+}
+//    DIV-DAG: #[[DIV_CONFIG:.+]] = #iree_cpu.lowering_config<cache_parallel = [34, 64, 0], distribution = [34, 64, 0], vector_common_parallel = [17, 16, 0], vector_reduction = [0, 0, 16]>
+//    DIV-DAG: #[[DIV_TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = #iree_cpu.pipeline<DoubleTilingExpert>, {{\{}}enable_loop_peeling}>
+//        DIV: func.func @matmul_divisor_289x384x3456(
+//   DIV-SAME:     translation_info = #[[DIV_TRANSLATION]]
+//        DIV:   linalg.matmul
+//   DIV-SAME:       lowering_config = #[[DIV_CONFIG]]
+
+// -----
+
+// Rule D: the rule P' N distribution 40 is not a multiple of the N vector tile
+// 16, so it moves to 32, the multiple of 16 dividing 160 nearest to 40.
+#executable_target_avx512_ = #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu_features = "+avx512f", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128", native_vector_size = 64 : index, target_triple = "x86_64-unknown-linux-gnu"}>
+func.func @matmul_divisor_289x160x768(%3: tensor<289x768xf32>, %4: tensor<768x160xf32>) -> tensor<289x160xf32> attributes {hal.executable.target = #executable_target_avx512_} {
+  %cst = arith.constant 0.000000e+00 : f32
+  %5 = tensor.empty() : tensor<289x160xf32>
+  %6 = linalg.fill ins(%cst : f32) outs(%5 : tensor<289x160xf32>) -> tensor<289x160xf32>
+  %7 = linalg.matmul ins(%3, %4 : tensor<289x768xf32>, tensor<768x160xf32>) outs(%6 : tensor<289x160xf32>) -> tensor<289x160xf32>
+  return %7 : tensor<289x160xf32>
+}
+//    DIV-DAG: #[[DIV_CONFIG:.+]] = #iree_cpu.lowering_config<cache_parallel = [34, 32, 0], distribution = [34, 32, 0], vector_common_parallel = [17, 16, 0], vector_reduction = [0, 0, 16]>
+//    DIV-DAG: #[[DIV_TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = #iree_cpu.pipeline<DoubleTilingExpert>, {{\{}}enable_loop_peeling}>
+//        DIV: func.func @matmul_divisor_289x160x768(
+//   DIV-SAME:     translation_info = #[[DIV_TRANSLATION]]
+//        DIV:   linalg.matmul
+//   DIV-SAME:       lowering_config = #[[DIV_CONFIG]]
+
+// -----
+
+// Rule D does not apply: 1225 has the divisor 7 in [5, 8] (rule P' keeps masking).
+#executable_target_avx512_ = #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu_features = "+avx512f", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128", native_vector_size = 64 : index, target_triple = "x86_64-unknown-linux-gnu"}>
+func.func @matmul_divisor_1225x224x1728(%3: tensor<1225x1728xf32>, %4: tensor<1728x224xf32>) -> tensor<1225x224xf32> attributes {hal.executable.target = #executable_target_avx512_} {
+  %cst = arith.constant 0.000000e+00 : f32
+  %5 = tensor.empty() : tensor<1225x224xf32>
+  %6 = linalg.fill ins(%cst : f32) outs(%5 : tensor<1225x224xf32>) -> tensor<1225x224xf32>
+  %7 = linalg.matmul ins(%3, %4 : tensor<1225x1728xf32>, tensor<1728x224xf32>) outs(%6 : tensor<1225x224xf32>) -> tensor<1225x224xf32>
+  return %7 : tensor<1225x224xf32>
+}
+//    DIV-DAG: #[[DIV_CONFIG:.+]] = #iree_cpu.lowering_config<distribution = [49, 56, 0], vector_common_parallel = [7, 16, 0], vector_reduction = [0, 0, 16]>
+//    DIV-DAG: #[[DIV_TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = #iree_cpu.pipeline<DoubleTilingExpert>>
+//        DIV: func.func @matmul_divisor_1225x224x1728(
+//   DIV-SAME:     translation_info = #[[DIV_TRANSLATION]]
+//        DIV:   linalg.matmul
+//   DIV-SAME:       lowering_config = #[[DIV_CONFIG]]
+
+// -----
+
+// Rule D does not apply: 5041 = 71 * 71 has no divisor in [5, 30].
+#executable_target_avx512_ = #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu_features = "+avx512f", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128", native_vector_size = 64 : index, target_triple = "x86_64-unknown-linux-gnu"}>
+func.func @matmul_divisor_5041x192x720(%3: tensor<5041x720xf32>, %4: tensor<720x192xf32>) -> tensor<5041x192xf32> attributes {hal.executable.target = #executable_target_avx512_} {
+  %cst = arith.constant 0.000000e+00 : f32
+  %5 = tensor.empty() : tensor<5041x192xf32>
+  %6 = linalg.fill ins(%cst : f32) outs(%5 : tensor<5041x192xf32>) -> tensor<5041x192xf32>
+  %7 = linalg.matmul ins(%3, %4 : tensor<5041x720xf32>, tensor<720x192xf32>) outs(%6 : tensor<5041x192xf32>) -> tensor<5041x192xf32>
+  return %7 : tensor<5041x192xf32>
+}
+//    DIV-DAG: #[[DIV_CONFIG:.+]] = #iree_cpu.lowering_config<cache_parallel = [64, 64, 0], distribution = [64, 64, 0], vector_common_parallel = [8, 32, 0], vector_reduction = [0, 0, 16]>
+//    DIV-DAG: #[[DIV_TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = #iree_cpu.pipeline<DoubleTilingExpert>, {{\{}}enable_loop_peeling}>
+//        DIV: func.func @matmul_divisor_5041x192x720(
+//   DIV-SAME:     translation_info = #[[DIV_TRANSLATION]]
+//        DIV:   linalg.matmul
+//   DIV-SAME:       lowering_config = #[[DIV_CONFIG]]
+
+// -----
+
+// Rule D does not apply: 3136 is a multiple of 8.
+#executable_target_avx512_ = #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {cpu_features = "+avx512f", data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128", native_vector_size = 64 : index, target_triple = "x86_64-unknown-linux-gnu"}>
+func.func @matmul_divisor_3136x256x2304(%3: tensor<3136x2304xf32>, %4: tensor<2304x256xf32>) -> tensor<3136x256xf32> attributes {hal.executable.target = #executable_target_avx512_} {
+  %cst = arith.constant 0.000000e+00 : f32
+  %5 = tensor.empty() : tensor<3136x256xf32>
+  %6 = linalg.fill ins(%cst : f32) outs(%5 : tensor<3136x256xf32>) -> tensor<3136x256xf32>
+  %7 = linalg.matmul ins(%3, %4 : tensor<3136x2304xf32>, tensor<2304x256xf32>) outs(%6 : tensor<3136x256xf32>) -> tensor<3136x256xf32>
+  return %7 : tensor<3136x256xf32>
+}
+//    DIV-DAG: #[[DIV_CONFIG:.+]] = #iree_cpu.lowering_config<cache_parallel = [64, 64, 0], distribution = [64, 64, 0], vector_common_parallel = [8, 32, 0], vector_reduction = [0, 0, 16]>
+//    DIV-DAG: #[[DIV_TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = #iree_cpu.pipeline<DoubleTilingExpert>, {{\{}}enable_loop_peeling}>
+//        DIV: func.func @matmul_divisor_3136x256x2304(
+//   DIV-SAME:     translation_info = #[[DIV_TRANSLATION]]
+//        DIV:   linalg.matmul
+//   DIV-SAME:       lowering_config = #[[DIV_CONFIG]]
 
 // -----
 
